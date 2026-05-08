@@ -240,3 +240,7 @@ If that works without prompting, the daemon will too.
 | `internal/merge` | Section-block parser + 3-way semantic merge |
 | `internal/gitwt` | Wrapper around the `git` CLI scoped to the sync work-tree |
 | `internal/config` | Config load/save (`~/.claudesync/config.json`) |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
