@@ -317,6 +317,33 @@ After 1.0 the standard SemVer rules kick in (breaking → major, additive → mi
    claude-memsync version     # confirms the upgrade landed
    ```
 
+### If the release workflow didn't fire
+
+GitHub's `release: published` event is occasionally missed — usually
+when the Release was created from a pre-existing tag via API. The
+workflow listens for both `published` and `released` activity types as
+a defensive measure, but it can still happen. Two recovery paths:
+
+- **Manual dispatch** (preferred): trigger the workflow against the
+  existing tag without touching the Release.
+
+  ```sh
+  gh workflow run release.yml --field tag=v0.1.8
+  gh run watch
+  ```
+
+  This re-uses the same build/upload steps and the existing Release
+  picks up the assets.
+
+- **Recreate the Release**: `gh release delete v0.1.8 --cleanup-tag=false`
+  then recreate it. Sometimes nudges GitHub into firing the event
+  properly. Manual dispatch is simpler — prefer it unless you also
+  need to fix release notes.
+
+The same `workflow_run` invocation works for retroactively building
+archives for any tag that doesn't yet have a Release, or for any
+Release whose previous build run failed.
+
 ### Building locally without a release
 
 For dev iteration, a plain `go build -o bin/ ./cmd/...` is enough — the
