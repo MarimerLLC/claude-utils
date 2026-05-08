@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
-)
 
-const version = "0.0.1-dev"
+	"github.com/MarimerLLC/claude-utils/internal/version"
+)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -15,7 +15,7 @@ func main() {
 
 	switch os.Args[1] {
 	case "version", "--version", "-v":
-		fmt.Println("claude-memsync", version)
+		fmt.Println(version.Strings("claude-memsync"))
 	case "help", "--help", "-h":
 		usage()
 	case "init":

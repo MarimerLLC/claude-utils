@@ -40,6 +40,17 @@ cd claude-utils
 go build -o bin/ ./cmd/...
 ```
 
+For a release build that stamps the version into the binary:
+
+```sh
+VERSION=$(git describe --tags --always --dirty)
+go build -ldflags "-X github.com/MarimerLLC/claude-utils/internal/version.Override=$VERSION" -o bin/ ./cmd/...
+```
+
+A plain `go build` (no ldflags) still produces a working binary —
+`claude-memsync version` falls back to the VCS revision Go embeds
+automatically (e.g. `dev+a52d68609b6e`).
+
 Both binaries (`claude-memsync` and `claude-memmerge`) end up in `bin/`.
 **They must live in the same directory** — `claude-memsync` finds the
 merge driver as a sibling. Move both to a stable location if you don't

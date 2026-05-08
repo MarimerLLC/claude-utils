@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/MarimerLLC/claude-utils/internal/merge"
+	"github.com/MarimerLLC/claude-utils/internal/version"
 )
 
 // claude-memmerge is a git custom merge driver for MEMORY.md files.
@@ -21,13 +22,11 @@ import (
 //
 // See: https://git-scm.com/docs/gitattributes#_defining_a_custom_merge_driver
 
-const version = "0.0.1-dev"
-
 func main() {
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
 		case "version", "--version", "-v":
-			fmt.Println("claude-memmerge", version)
+			fmt.Println(version.Strings("claude-memmerge"))
 			return
 		case "help", "--help", "-h":
 			usage()
