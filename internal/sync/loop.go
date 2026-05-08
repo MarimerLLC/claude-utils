@@ -72,7 +72,16 @@ func (l *Loop) Run(ctx context.Context) error {
 
 	pendingLocal := false
 
-	// Initial sync at startup: bring everything in line, push any new local content.
+	// Initial sync at startup: reconcile local with mirror (using manifest
+	// to detect deletes that happened while the daemon was off), then flush.
+	manifest, err := LoadManifest(l.Cfg.SyncDir)
+	if err != nil {
+		log.Println("load manifest (continuing without delete detection):", err)
+		manifest = NewManifest()
+	}
+	if _, err := Reconcile(roots, manifest); err != nil {
+		log.Println("initial reconcile:", err)
+	}
 	if err := l.flush(repo, roots, true); err != nil {
 		log.Println("initial flush:", err)
 		if l.OnFlush != nil {
@@ -81,6 +90,7 @@ func (l *Loop) Run(ctx context.Context) error {
 	} else if l.OnFlush != nil {
 		l.OnFlush(true, nil)
 	}
+	l.refreshManifest(roots)
 
 	for {
 		select {
@@ -113,6 +123,7 @@ func (l *Loop) Run(ctx context.Context) error {
 			if err != nil {
 				log.Println("flush (local):", err)
 			}
+			l.refreshManifest(roots)
 			if l.OnFlush != nil {
 				l.OnFlush(true, err)
 			}
@@ -125,13 +136,21 @@ func (l *Loop) Run(ctx context.Context) error {
 			// Safety net: re-walk the Claude tree to catch any watcher events
 			// missed by races (e.g., a new project dir and memory file created
 			// in rapid succession before the new dir's watcher was registered).
-			if _, err := Reconcile(roots); err != nil {
+			// Using the on-disk manifest also lets us propagate deletes the
+			// watcher missed.
+			m, err := LoadManifest(l.Cfg.SyncDir)
+			if err != nil {
+				log.Println("load manifest:", err)
+				m = NewManifest()
+			}
+			if _, err := Reconcile(roots, m); err != nil {
 				log.Println("reconcile:", err)
 			}
-			err := l.flush(repo, roots, true)
+			err = l.flush(repo, roots, true)
 			if err != nil {
 				log.Println("flush (pull):", err)
 			}
+			l.refreshManifest(roots)
 			if l.OnFlush != nil {
 				l.OnFlush(false, err)
 			}
@@ -294,6 +313,20 @@ func refreshMemoryWatches(w *fsnotify.Watcher, claudeRoot string) error {
 		}
 	}
 	return nil
+}
+
+// refreshManifest rebuilds the manifest from the current Claude tree state
+// and saves it. Called after every successful flush so that the next
+// Reconcile reasons against an up-to-date "as of last sync" snapshot.
+func (l *Loop) refreshManifest(roots Roots) {
+	m, err := BuildFromClaudeTree(roots.Claude)
+	if err != nil {
+		log.Println("build manifest:", err)
+		return
+	}
+	if err := m.Save(l.Cfg.SyncDir); err != nil {
+		log.Println("save manifest:", err)
+	}
 }
 
 // shouldIgnoreFile returns true for filenames the daemon should not sync.

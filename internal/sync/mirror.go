@@ -60,26 +60,39 @@ func (r Roots) MemoryDirs() ([]string, error) {
 
 // SyncReport is returned by reconciliation operations for diagnostics.
 type SyncReport struct {
-	CopiedToMirror []string // relative paths copied Claude → mirror
-	CopiedToClaude []string // relative paths copied mirror → Claude
-	Merged         []string // MEMORY.md paths semantically merged
-	BackedUp       []string // mirror copies preserved as .from-remote-* on collision
+	CopiedToMirror    []string // relative paths copied Claude → mirror
+	CopiedToClaude    []string // relative paths copied mirror → Claude
+	Merged            []string // MEMORY.md paths semantically merged
+	BackedUp          []string // mirror copies preserved as .from-remote-* on collision
+	RemovedFromMirror []string // user-deleted files removed from mirror (manifest-detected)
 }
 
-// Reconcile performs an initial bidirectional sync between the two trees.
+// Reconcile performs a bidirectional sync between the two trees, using the
+// manifest to distinguish "user deleted this" from "this is new from
+// another PC." Pass a nil or empty manifest to disable delete detection
+// (the safe behavior for first-ever sync, since with no prior state we
+// can't know what to delete).
 //
-//   - Files only in Claude → copied to mirror.
-//   - Files only in mirror → copied to Claude.
-//   - Files in both with identical content → ignored.
-//   - MEMORY.md present in both with differing content → merged via
-//     merge.Merge (empty base), result written to both sides.
-//   - Other files differing in both sides → mirror's copy is renamed to
-//     <name>.from-remote-<random> and Claude's version becomes authoritative.
+// Decisions for each file path:
 //
-// This function is intended for use during `init` and as a periodic safety
-// net. The watcher-driven sync loop only handles incremental events.
-func Reconcile(r Roots) (SyncReport, error) {
+//   - Claude has, mirror has, identical → no-op
+//   - Claude has, mirror has, differs    → MEMORY.md is merged via the
+//     section-block merger; other files keep Claude and back the mirror
+//     copy up as <name>.from-remote-<random>
+//   - Claude has, mirror missing         → copy Claude → mirror
+//   - Claude missing, mirror has, in manifest    → user deleted; remove
+//     from mirror so the next git push propagates it
+//   - Claude missing, mirror has, NOT in manifest → new from another PC;
+//     copy mirror → Claude
+//
+// This function is used during `init` and as a periodic safety net on the
+// pull tick. The watcher-driven sync loop also handles incremental events
+// directly via CopyToMirror / RemoveFromMirror.
+func Reconcile(r Roots, manifest *Manifest) (SyncReport, error) {
 	rep := SyncReport{}
+	if manifest == nil {
+		manifest = NewManifest()
+	}
 
 	hashes, err := r.MemoryDirs()
 	if err != nil {
@@ -121,11 +134,11 @@ func Reconcile(r Roots) (SyncReport, error) {
 		for name := range files {
 			cp := filepath.Join(claudeMem, name)
 			mp := filepath.Join(mirrorMem, name)
+			rel := filepath.ToSlash(filepath.Join(hash, "memory", name))
 
 			cExists, cBytes := readIfExists(cp)
 			mExists, mBytes := readIfExists(mp)
-
-			rel := filepath.ToSlash(filepath.Join(hash, "memory", name))
+			wasInManifest := manifest.Has(rel)
 
 			switch {
 			case cExists && !mExists:
@@ -134,7 +147,16 @@ func Reconcile(r Roots) (SyncReport, error) {
 				}
 				rep.CopiedToMirror = append(rep.CopiedToMirror, rel)
 
+			case !cExists && mExists && wasInManifest:
+				// User deleted on this PC. Remove from mirror so the next
+				// git commit/push propagates the deletion.
+				if err := os.Remove(mp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return rep, fmt.Errorf("remove mirror %s: %w", mp, err)
+				}
+				rep.RemovedFromMirror = append(rep.RemovedFromMirror, rel)
+
 			case !cExists && mExists:
+				// Not in manifest → new from another PC.
 				if err := os.MkdirAll(claudeMem, 0700); err != nil {
 					return rep, err
 				}

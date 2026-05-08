@@ -124,7 +124,10 @@ func bootstrap(cfg config.Config, force bool) error {
 		return err
 	}
 	roots := syncpkg.Roots{Claude: cfg.ClaudeProjectsDir, Mirror: mirrorProjects}
-	report, err := syncpkg.Reconcile(roots)
+	// First-time init: no manifest yet. Pass nil so Reconcile doesn't try
+	// to propagate deletes (with no prior state, "missing in Claude" can't
+	// be distinguished from "this PC never had it").
+	report, err := syncpkg.Reconcile(roots, nil)
 	if err != nil {
 		return fmt.Errorf("reconcile: %w", err)
 	}
@@ -148,6 +151,14 @@ func bootstrap(cfg config.Config, force bool) error {
 			return fmt.Errorf("git push: %w", err)
 		}
 		fmt.Fprintln(os.Stderr, "pushed to", cfg.RemoteURL)
+	}
+
+	// Capture the post-init Claude state so the first Reconcile after the
+	// daemon starts can correctly detect deletions.
+	if m, err := syncpkg.BuildFromClaudeTree(cfg.ClaudeProjectsDir); err == nil {
+		if err := m.Save(cfg.SyncDir); err != nil {
+			fmt.Fprintln(os.Stderr, "save manifest:", err)
+		}
 	}
 
 	fmt.Fprintln(os.Stderr, "init OK")
@@ -183,6 +194,7 @@ func writeGitignore(syncDir string) error {
 	content := `# Managed by claude-memsync — local-only daemon state, must not sync.
 config.json
 daemon.pid
+.state/
 *.tmp
 *.from-remote-*
 `
