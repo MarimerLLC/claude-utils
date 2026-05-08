@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/MarimerLLC/claude-utils/internal/proc"
 )
 
 // detachedSysProcAttr returns SysProcAttr that detaches the spawned
@@ -134,7 +136,9 @@ func statusTask() (string, error) {
 // Windows os.FindProcess always succeeds, so we probe via `tasklist` to
 // keep the implementation small and avoid pulling in golang.org/x/sys.
 func processAlive(pid int) bool {
-	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH", "/FO", "CSV").Output()
+	cmd := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH", "/FO", "CSV")
+	proc.HideWindow(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return false
 	}

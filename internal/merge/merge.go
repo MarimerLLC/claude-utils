@@ -22,6 +22,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/MarimerLLC/claude-utils/internal/proc"
 )
 
 // PreambleKey is the synthetic key used for content before the first H2 heading.
@@ -292,6 +294,7 @@ func mergeDiff3(base, ours, theirs string) (string, bool) {
 	}
 
 	cmd := exec.Command("git", "merge-file", "-p", op, bp, tp)
+	proc.HideWindow(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

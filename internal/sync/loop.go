@@ -209,6 +209,11 @@ func (l *Loop) handleEvent(watcher *fsnotify.Watcher, roots Roots, ev fsnotify.E
 
 // flush stages local changes, optionally commits, pulls remote work, propagates
 // any pull-driven changes back to the Claude tree, and pushes.
+//
+// Before doing any pull/push, flush asks origin for the current branch SHA
+// (a single ls-remote round-trip). If origin's SHA matches our cached
+// refs/remotes/origin/<branch> AND we have no unpushed commits, it returns
+// early — skipping the full pull/push churn that dominates idle ticks.
 func (l *Loop) flush(repo *gitwt.Repo, roots Roots, includeLocal bool) error {
 	if includeLocal {
 		if err := repo.AddAll(); err != nil {
@@ -218,6 +223,10 @@ func (l *Loop) flush(repo *gitwt.Repo, roots Roots, includeLocal bool) error {
 		if err != nil {
 			return fmt.Errorf("commit: %w", err)
 		}
+	}
+
+	if idle, err := remoteAndLocalIdle(repo, l.Branch); err == nil && idle {
+		return nil
 	}
 
 	preRev, _ := repo.Run("rev-parse", "HEAD")
@@ -236,6 +245,29 @@ func (l *Loop) flush(repo *gitwt.Repo, roots Roots, includeLocal bool) error {
 		return fmt.Errorf("push: %w", err)
 	}
 	return nil
+}
+
+// remoteAndLocalIdle reports whether there is nothing to do: origin's branch
+// SHA matches our cached remote-tracking ref AND we have no unpushed commits.
+// Returns (false, nil) when the gate cannot prove idleness — including the
+// first run before refs/remotes/origin/<branch> exists locally.
+func remoteAndLocalIdle(repo *gitwt.Repo, branch string) (bool, error) {
+	remoteSHA, err := repo.LsRemoteHead(branch)
+	if err != nil || remoteSHA == "" {
+		return false, err
+	}
+	cachedSHA, err := repo.Run("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch)
+	if err != nil {
+		return false, nil // remote-tracking ref missing → can't prove idle
+	}
+	if strings.TrimSpace(cachedSHA) != remoteSHA {
+		return false, nil // remote moved
+	}
+	unpushed, err := repo.Run("rev-list", "--count", "refs/remotes/origin/"+branch+"..HEAD")
+	if err != nil {
+		return false, nil
+	}
+	return strings.TrimSpace(unpushed) == "0", nil
 }
 
 // propagateChanges replays the file changes between pre and post revisions

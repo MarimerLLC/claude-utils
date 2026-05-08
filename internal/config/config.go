@@ -45,7 +45,7 @@ func Defaults() Config {
 		SyncDir:           filepath.Join(home, ".claudesync"),
 		ClaudeProjectsDir: filepath.Join(home, ".claude", "projects"),
 		DebounceMs:        3000,
-		PullIntervalSec:   30,
+		PullIntervalSec:   3600,
 	}
 }
 

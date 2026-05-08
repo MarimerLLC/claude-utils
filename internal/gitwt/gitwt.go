@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/MarimerLLC/claude-utils/internal/proc"
 )
 
 // Repo represents a local git working tree at a fixed path.
@@ -26,6 +28,7 @@ func New(dir string) *Repo { return &Repo{Dir: dir} }
 func (r *Repo) Run(args ...string) (string, error) {
 	full := append([]string{"-C", r.Dir}, args...)
 	cmd := exec.Command("git", full...)
+	proc.HideWindow(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -44,6 +47,7 @@ func (r *Repo) IsRepo() bool {
 // Clone clones url into r.Dir. r.Dir must not already exist or must be empty.
 func (r *Repo) Clone(url string) error {
 	cmd := exec.Command("git", "clone", url, r.Dir)
+	proc.HideWindow(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -55,6 +59,7 @@ func (r *Repo) Clone(url string) error {
 // Init runs `git init` in r.Dir. The directory is created if missing.
 func (r *Repo) Init(defaultBranch string) error {
 	cmd := exec.Command("git", "init", "-b", defaultBranch, r.Dir)
+	proc.HideWindow(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -133,9 +138,29 @@ func (r *Repo) CurrentBranch() (string, error) {
 // FetchOriginBranch returns whether the named branch exists on origin.
 // Used to decide between "first push" and "pull then push" on init.
 func (r *Repo) FetchOriginBranch(branch string) (bool, error) {
-	out, err := r.Run("ls-remote", "--heads", "origin", branch)
+	sha, err := r.LsRemoteHead(branch)
 	if err != nil {
 		return false, err
 	}
-	return strings.TrimSpace(out) != "", nil
+	return sha != "", nil
+}
+
+// LsRemoteHead asks origin for the current SHA of refs/heads/<branch>.
+// Returns ("", nil) if origin has no such branch yet. This is a single
+// network round-trip with no working-tree side effects — used as a cheap
+// gate to skip full pull/push cycles when the remote hasn't moved.
+func (r *Repo) LsRemoteHead(branch string) (string, error) {
+	out, err := r.Run("ls-remote", "--heads", "origin", branch)
+	if err != nil {
+		return "", err
+	}
+	line := strings.TrimSpace(out)
+	if line == "" {
+		return "", nil
+	}
+	// Format: "<sha>\trefs/heads/<branch>"
+	if i := strings.IndexAny(line, " \t"); i > 0 {
+		return line[:i], nil
+	}
+	return "", nil
 }
