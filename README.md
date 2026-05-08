@@ -1,5 +1,7 @@
 # claude-utils
 
+[![CI](https://github.com/MarimerLLC/claude-utils/actions/workflows/ci.yml/badge.svg)](https://github.com/MarimerLLC/claude-utils/actions/workflows/ci.yml)
+
 Cross-workstation tooling for Claude Code.
 
 ## claude-memsync
