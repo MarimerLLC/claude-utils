@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: Build and upload archives
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build cross-platform archives
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -X github.com/MarimerLLC/claude-utils/internal/version.Override=${VERSION}"
+          mkdir -p dist
+
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            GOOS=${target%/*}
+            GOARCH=${target#*/}
+            name="claude-utils-${VERSION}-${GOOS}-${GOARCH}"
+            outdir="dist/${name}"
+            mkdir -p "${outdir}"
+            ext=""
+            if [ "${GOOS}" = "windows" ]; then ext=".exe"; fi
+
+            echo "::group::build ${target}"
+            GOOS="${GOOS}" GOARCH="${GOARCH}" go build -trimpath -ldflags "${LDFLAGS}" \
+              -o "${outdir}/claude-memsync${ext}" ./cmd/claude-memsync
+            GOOS="${GOOS}" GOARCH="${GOARCH}" go build -trimpath -ldflags "${LDFLAGS}" \
+              -o "${outdir}/claude-memmerge${ext}" ./cmd/claude-memmerge
+            echo "::endgroup::"
+
+            cp LICENSE README.md "${outdir}/"
+
+            (
+              cd dist
+              if [ "${GOOS}" = "windows" ]; then
+                zip -qr "${name}.zip" "${name}"
+              else
+                tar -czf "${name}.tar.gz" "${name}"
+              fi
+            )
+          done
+
+          (cd dist && sha256sum *.zip *.tar.gz > SHA256SUMS)
+          ls -lh dist/
+
+      - name: Upload archives to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "${VERSION}" \
+            dist/*.zip dist/*.tar.gz dist/SHA256SUMS \
+            --clobber \
+            --repo "${{ github.repository }}"

@@ -281,41 +281,59 @@ After 1.0 the standard SemVer rules kick in (breaking → major, additive → mi
 
 ### Cutting a release
 
-1. Land all changes on `main` and confirm `go test ./...` is clean.
-2. Tag the commit:
+1. Land all changes on `main` and confirm CI is green.
+2. Create a GitHub Release for the version. Either:
 
    ```sh
-   git tag -a v0.1.8 -m "v0.1.8
-
-   - <bullet summary of user-visible changes>"
-   git push origin main
-   git push origin v0.1.8
+   gh release create v0.1.8 \
+     --title "v0.1.8" \
+     --notes "- <bullet summary of user-visible changes>" \
+     --target main
    ```
 
-3. Build release binaries with the version stamped in:
+   …or use the GitHub UI (Releases → Draft a new release → choose tag
+   `v0.1.8`, target `main`, fill in title and notes, **Publish**).
+
+3. Publishing the Release fires `.github/workflows/release.yml`, which
+   cross-compiles both binaries for {linux, darwin, windows} ×
+   {amd64, arm64}, stamps the version in via `-ldflags`, packages each
+   target as `claude-utils-v0.1.8-<os>-<arch>.{tar.gz,zip}`, generates
+   `SHA256SUMS`, and uploads everything to the Release. ~1 minute.
+
+4. Watch the run finish:
 
    ```sh
-   VERSION=$(git describe --tags --always --dirty)
-   go build -ldflags "-X github.com/MarimerLLC/claude-utils/internal/version.Override=$VERSION" -o bin/ ./cmd/...
+   gh run watch
+   gh release view v0.1.8     # confirms the assets are attached
    ```
 
-   PowerShell equivalent:
-
-   ```powershell
-   $VERSION = git describe --tags --always --dirty
-   go build -ldflags "-X github.com/MarimerLLC/claude-utils/internal/version.Override=$VERSION" -o bin\ .\cmd\...
-   ```
-
-4. Verify: `bin/claude-memsync version` should print `claude-memsync v0.1.8`.
-
-5. Stop the running daemon, copy the new binaries over, restart:
+5. To upgrade your own machine, download the appropriate archive from
+   the Release page, extract, and swap the binaries:
 
    ```sh
    claude-memsync stop
-   # copy bin/* to your install location
+   # extract archive, copy bin/* to your install location
    claude-memsync start
-   claude-memsync version   # confirms the upgrade landed
+   claude-memsync version     # confirms the upgrade landed
    ```
+
+### Building locally without a release
+
+For dev iteration, a plain `go build -o bin/ ./cmd/...` is enough — the
+binaries will report a VCS-derived `dev+<sha>` version. To stamp a
+specific version into a local build:
+
+```sh
+VERSION=$(git describe --tags --always --dirty)
+go build -ldflags "-X github.com/MarimerLLC/claude-utils/internal/version.Override=$VERSION" -o bin/ ./cmd/...
+```
+
+PowerShell equivalent:
+
+```powershell
+$VERSION = git describe --tags --always --dirty
+go build -ldflags "-X github.com/MarimerLLC/claude-utils/internal/version.Override=$VERSION" -o bin\ .\cmd\...
+```
 
 ### How version resolution works
 
