@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/kardianos/service"
 
@@ -14,8 +16,11 @@ import (
 	syncpkg "github.com/MarimerLLC/claude-utils/internal/sync"
 )
 
-// program implements the kardianos/service.Interface, hosting the sync
-// loop inside the OS service supervisor.
+// program implements kardianos/service.Interface so that the `run`
+// subcommand works identically when launched from a terminal, by a Windows
+// scheduled task, or by a systemd/launchd user unit. The lifecycle install
+// path (install/uninstall/start/stop/status) is handled separately per
+// platform — see task_windows.go and task_other.go.
 type program struct {
 	configPath string
 	cancel     context.CancelFunc
@@ -49,9 +54,6 @@ func (p *program) Stop(s service.Service) error {
 	return p.loopErr
 }
 
-// serviceConfig builds the kardianos/service Config used by every lifecycle
-// subcommand. The OS-managed instance is always launched with the "run"
-// argument so it shares a single code path with foreground use.
 func serviceConfig(configPath string) *service.Config {
 	args := []string{"run"}
 	if configPath != "" {
@@ -65,17 +67,45 @@ func serviceConfig(configPath string) *service.Config {
 	}
 }
 
-func newService(configPath string) (service.Service, *program, error) {
-	prg := &program{configPath: configPath}
-	svc, err := service.New(prg, serviceConfig(configPath))
-	if err != nil {
-		return nil, nil, err
-	}
-	return svc, prg, nil
+func defaultConfigPath() string {
+	return filepath.Join(defaultSyncDir(), "config.json")
 }
 
-func defaultConfigPath() string {
-	return filepath.Join(config.Defaults().SyncDir, "config.json")
+func defaultSyncDir() string {
+	return config.Defaults().SyncDir
+}
+
+// pidFilePath is the location of the daemon PID file. It is written by
+// runService at startup (and removed on exit) so that the start/stop/status
+// subcommands on Windows can manage the daemon process directly.
+func pidFilePath() string {
+	return filepath.Join(defaultSyncDir(), "daemon.pid")
+}
+
+func readPidFile() (int, error) {
+	b, err := os.ReadFile(pidFilePath())
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0, err
+	}
+	return pid, nil
+}
+
+func writePidFile(pid int) error {
+	if err := os.MkdirAll(filepath.Dir(pidFilePath()), 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(pidFilePath(), []byte(strconv.Itoa(pid)), 0600)
+}
+
+func removePidFile() error {
+	if err := os.Remove(pidFilePath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func runInstall(args []string) int {
@@ -96,12 +126,7 @@ func runInstall(args []string) int {
 		fmt.Fprintf(os.Stderr, "config %s not found — run `claude-memsync init` first\n", abs)
 		return 1
 	}
-	svc, _, err := newService(abs)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "service:", err)
-		return 1
-	}
-	if err := svc.Install(); err != nil {
+	if err := installTask(abs); err != nil {
 		fmt.Fprintln(os.Stderr, "install:", err)
 		return 1
 	}
@@ -110,14 +135,7 @@ func runInstall(args []string) int {
 }
 
 func runUninstall(args []string) int {
-	svc, _, err := newService(defaultConfigPath())
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "service:", err)
-		return 1
-	}
-	// Best-effort stop, then uninstall.
-	_ = svc.Stop()
-	if err := svc.Uninstall(); err != nil {
+	if err := uninstallTask(); err != nil {
 		fmt.Fprintln(os.Stderr, "uninstall:", err)
 		return 1
 	}
@@ -126,12 +144,7 @@ func runUninstall(args []string) int {
 }
 
 func runStart(args []string) int {
-	svc, _, err := newService(defaultConfigPath())
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "service:", err)
-		return 1
-	}
-	if err := svc.Start(); err != nil {
+	if err := startTask(); err != nil {
 		fmt.Fprintln(os.Stderr, "start:", err)
 		return 1
 	}
@@ -140,12 +153,7 @@ func runStart(args []string) int {
 }
 
 func runStop(args []string) int {
-	svc, _, err := newService(defaultConfigPath())
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "service:", err)
-		return 1
-	}
-	if err := svc.Stop(); err != nil {
+	if err := stopTask(); err != nil {
 		fmt.Fprintln(os.Stderr, "stop:", err)
 		return 1
 	}
@@ -154,34 +162,31 @@ func runStop(args []string) int {
 }
 
 func runStatus(args []string) int {
-	svc, _, err := newService(defaultConfigPath())
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "service:", err)
-		return 1
-	}
-	st, err := svc.Status()
+	st, err := statusTask()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "status:", err)
 		return 1
 	}
-	switch st {
-	case service.StatusRunning:
-		fmt.Println("running")
-	case service.StatusStopped:
-		fmt.Println("stopped")
-	default:
-		fmt.Println("unknown")
-	}
+	fmt.Println(st)
 	return 0
 }
 
-// runService dispatches to either foreground (`run`) or service-managed mode.
-// kardianos/service detects the launching environment automatically.
+// runService is the entry point for `claude-memsync run`. It wraps the loop
+// in kardianos's service.Run() so the same code path serves both interactive
+// invocation (terminal, Windows scheduled task, systemd user unit) and any
+// future move to true SCM-managed mode.
 func runService(configPath string) int {
 	if configPath == "" {
 		configPath = defaultConfigPath()
 	}
-	svc, _, err := newService(configPath)
+
+	if err := writePidFile(os.Getpid()); err != nil {
+		log.Println("warning: write pid file:", err)
+	}
+	defer removePidFile()
+
+	prg := &program{configPath: configPath}
+	svc, err := service.New(prg, serviceConfig(configPath))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "service:", err)
 		return 1
@@ -197,9 +202,6 @@ func runService(configPath string) int {
 	return 0
 }
 
-// serviceLogWriter adapts the standard log package to the kardianos service
-// logger, so log output reaches the platform's native log destination
-// (Windows Event Log, journald, etc.) when running under SCM.
 type serviceLogWriter struct{ logger service.Logger }
 
 func (w serviceLogWriter) Write(p []byte) (int, error) {

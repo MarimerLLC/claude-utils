@@ -122,7 +122,13 @@ func (l *Loop) Run(ctx context.Context) error {
 			if pendingLocal {
 				continue // debounce will handle it
 			}
-			err := l.flush(repo, roots, false)
+			// Safety net: re-walk the Claude tree to catch any watcher events
+			// missed by races (e.g., a new project dir and memory file created
+			// in rapid succession before the new dir's watcher was registered).
+			if _, err := Reconcile(roots); err != nil {
+				log.Println("reconcile:", err)
+			}
+			err := l.flush(repo, roots, true)
 			if err != nil {
 				log.Println("flush (pull):", err)
 			}

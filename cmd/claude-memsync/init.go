@@ -109,6 +109,9 @@ func bootstrap(cfg config.Config, force bool) error {
 	if err := writeGitattributes(cfg.SyncDir); err != nil {
 		return fmt.Errorf("write .gitattributes: %w", err)
 	}
+	if err := writeGitignore(cfg.SyncDir); err != nil {
+		return fmt.Errorf("write .gitignore: %w", err)
+	}
 
 	// Step 4: write config.json.
 	if err := config.Save(cfg); err != nil {
@@ -167,6 +170,22 @@ func tryClone(repo *gitwt.Repo, url string) (bool, error) {
 func writeGitattributes(syncDir string) error {
 	path := filepath.Join(syncDir, gitattributesRel)
 	content := fmt.Sprintf("# Managed by claude-memsync — semantic merge for memory index files.\nMEMORY.md merge=%s\n", mergeDriverName)
+	return os.WriteFile(path, []byte(content), 0600)
+}
+
+// writeGitignore excludes per-PC daemon state from the sync repo. config.json
+// embeds machine-specific paths (e.g. MergeDriverPath), so it must NOT be
+// shared across workstations; each PC writes its own at init time. Likewise,
+// daemon.pid is runtime state and *.from-remote-* are local conflict backups
+// surfaced for the user — none of these should propagate.
+func writeGitignore(syncDir string) error {
+	path := filepath.Join(syncDir, ".gitignore")
+	content := `# Managed by claude-memsync — local-only daemon state, must not sync.
+config.json
+daemon.pid
+*.tmp
+*.from-remote-*
+`
 	return os.WriteFile(path, []byte(content), 0600)
 }
 
