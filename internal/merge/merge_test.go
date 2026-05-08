@@ -226,9 +226,9 @@ kubectl context: rockbot-prod.
 	for _, want := range []string{
 		"## Blazor Docker Build",
 		"## Deploy Workflow",
-		"## Agent Directives", // ours-only
-		"## Cluster Auth",     // theirs-only
-		"blazor.web.js 404s",  // body edit from theirs
+		"## Agent Directives",     // ours-only
+		"## Cluster Auth",         // theirs-only
+		"blazor.web.js 404s",      // body edit from theirs
 		"kubectl rollout restart", // list addition from ours
 	} {
 		if !strings.Contains(got, want) {

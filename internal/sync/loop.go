@@ -21,10 +21,10 @@ import (
 // mirrors file changes into the sync work-tree, and runs git commit/pull/push
 // cycles on a debounce.
 type Loop struct {
-	Cfg       config.Config
-	Branch    string
-	Hostname  string
-	OnFlush   func(localChanges bool, err error) // optional, for tests/observability
+	Cfg      config.Config
+	Branch   string
+	Hostname string
+	OnFlush  func(localChanges bool, err error) // optional, for tests/observability
 }
 
 // Run blocks until ctx is canceled. Returns the first fatal error or nil
