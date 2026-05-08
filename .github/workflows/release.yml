@@ -2,7 +2,13 @@ name: Release
 
 on:
   release:
-    types: [published]
+    types: [published, released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and upload archives for (e.g. v0.1.7)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,6 +21,8 @@ jobs:
       CGO_ENABLED: 0
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - uses: actions/setup-go@v6
         with:
@@ -23,7 +31,7 @@ jobs:
 
       - name: Build cross-platform archives
         env:
-          VERSION: ${{ github.event.release.tag_name }}
+          VERSION: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
           LDFLAGS="-s -w -X github.com/MarimerLLC/claude-utils/internal/version.Override=${VERSION}"
@@ -63,7 +71,7 @@ jobs:
       - name: Upload archives to release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ github.event.release.tag_name }}
+          VERSION: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           gh release upload "${VERSION}" \
             dist/*.zip dist/*.tar.gz dist/SHA256SUMS \
