@@ -132,10 +132,16 @@ credential vault and SSH keys. None require root.
                   ▼
                 <remote>                  (private GitHub repo)
                   │
-                  │  pull on 30s timer or after local push
+                  │  ls-remote check on 1h timer (or after local push);
+                  │  full pull only when remote SHA actually moved
                   ▼
    propagate pull-driven changes back to ~/.claude/projects/...
 ```
+
+Idle ticks cost a single `git ls-remote` round-trip — no pull, no push,
+no merge driver invocation. The full pull/push cycle runs only when
+origin's branch SHA differs from the local `refs/remotes/origin/<branch>`
+or when there are unpushed commits.
 
 - The daemon never edits files in `~/.claude/projects/...` while a write
   is in progress — it copies into the mirror first, then any inbound
@@ -251,6 +257,74 @@ If that works without prompting, the daemon will too.
 | `internal/merge` | Section-block parser + 3-way semantic merge |
 | `internal/gitwt` | Wrapper around the `git` CLI scoped to the sync work-tree |
 | `internal/config` | Config load/save (`~/.claudesync/config.json`) |
+| `internal/proc` | Cross-platform helper that hides child-process console windows on Windows |
+| `internal/version` | Version resolution from `-ldflags` override or embedded VCS info |
+
+## Releasing
+
+Versioning follows [SemVer](https://semver.org): `vMAJOR.MINOR.PATCH`.
+We're pre-1.0, which means the daemon's behavior, config format, and
+on-disk layout may still change between minor versions; bumping the
+patch is reserved for fixes that don't change observable behavior.
+
+Bump rules while on `0.x`:
+
+| Change | Bump |
+|---|---|
+| Bug fix, internal refactor, doc update | patch (`v0.1.7` → `v0.1.8`) |
+| Behavior change, new feature, default change, new config field | minor (`v0.1.x` → `v0.2.0`) |
+| Breaking change to config format, on-disk layout, or CLI surface | minor while pre-1.0 — but call it out clearly in the tag message |
+
+After 1.0 the standard SemVer rules kick in (breaking → major, additive → minor, fix → patch). At that point a `v2+` would also need a `/v2` suffix in the Go module path.
+
+### Cutting a release
+
+1. Land all changes on `main` and confirm `go test ./...` is clean.
+2. Tag the commit:
+
+   ```sh
+   git tag -a v0.1.8 -m "v0.1.8
+
+   - <bullet summary of user-visible changes>"
+   git push origin main
+   git push origin v0.1.8
+   ```
+
+3. Build release binaries with the version stamped in:
+
+   ```sh
+   VERSION=$(git describe --tags --always --dirty)
+   go build -ldflags "-X github.com/MarimerLLC/claude-utils/internal/version.Override=$VERSION" -o bin/ ./cmd/...
+   ```
+
+   PowerShell equivalent:
+
+   ```powershell
+   $VERSION = git describe --tags --always --dirty
+   go build -ldflags "-X github.com/MarimerLLC/claude-utils/internal/version.Override=$VERSION" -o bin\ .\cmd\...
+   ```
+
+4. Verify: `bin/claude-memsync version` should print `claude-memsync v0.1.8`.
+
+5. Stop the running daemon, copy the new binaries over, restart:
+
+   ```sh
+   claude-memsync stop
+   # copy bin/* to your install location
+   claude-memsync start
+   claude-memsync version   # confirms the upgrade landed
+   ```
+
+### How version resolution works
+
+`internal/version.String()` returns the first of:
+
+1. The build-time `Override` set via `-ldflags "-X .../internal/version.Override=<v>"` (preferred for releases).
+2. `runtime/debug.BuildInfo.Main.Version` — populated automatically when installed via `go install <path>@<tag>`. Yields `v0.1.7` for tagged installs, or a pseudo-version like `v0.0.0-20260508213755-a52d68630b31` for untagged commits.
+3. `vcs.revision` from the embedded build settings — yields `dev+<short-sha>` (or `dev+<short-sha>-dirty` if the working tree had uncommitted changes at build time).
+4. The literal `dev` — only seen if Go embedded no VCS info (e.g. building from outside a git checkout).
+
+This means a plain `go build` always produces a binary whose `version` subcommand says something useful — no Makefile or build script required for development.
 
 ## License
 
