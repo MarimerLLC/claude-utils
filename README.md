@@ -96,10 +96,12 @@ claude-memsync status
 
 `install` registers the daemon to auto-start when you log in:
 
-- **Windows**: drops `claude-memsync.cmd` in
-  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`. No admin
-  required. (Task Scheduler was investigated; it requires admin even for
-  per-user logon tasks, so the Startup folder is the simpler path.)
+- **Windows**: drops `claude-memsync.vbs` in
+  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`. The script
+  launches the daemon hidden and detached via `WScript.Shell.Run`, so no
+  console window is left behind at logon. No admin required. (Task
+  Scheduler was investigated; it requires admin even for per-user logon
+  tasks, so the Startup folder is the simpler path.)
 - **Linux**: writes a systemd user unit at
   `~/.config/systemd/user/claude-memsync.service` and enables it.
 - **macOS**: writes a launchd plist at
