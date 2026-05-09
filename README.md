@@ -322,9 +322,8 @@ After 1.0 the standard SemVer rules kick in (breaking → major, additive → mi
 ### If the release workflow didn't fire
 
 GitHub's `release: published` event is occasionally missed — usually
-when the Release was created from a pre-existing tag via API. The
-workflow listens for both `published` and `released` activity types as
-a defensive measure, but it can still happen. Two recovery paths:
+when the Release was created from a pre-existing tag via API. Two
+recovery paths:
 
 - **Manual dispatch** (preferred): trigger the workflow against the
   existing tag without touching the Release.
