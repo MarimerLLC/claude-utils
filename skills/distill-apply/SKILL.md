@@ -16,13 +16,23 @@ project's memory so Claude here starts out knowing them.
 Run this **from within the project you want to enrich** — its memory directory is
 the one the harness lets you write to without prompting.
 
+## Paths & environment — go straight there, don't go exploring
+
+Work only with two known locations: `~/.claudesync/distilled/` and the current
+project's memory directory. **Do not probe `$HOME` or `~/.claudesync/` (the
+parent) to "orient"** — it triggers needless permission prompts. The entry files
+are the source of truth; the `DISTILLED.md` index is just a convenience, and
+`claude-memsync` may not be on PATH — don't hunt for the binary.
+
 ## Steps
 
-1. **Refresh and read the catalog.** Run `claude-memsync distill` to regenerate
-   the index, then read `~/.claudesync/distilled/DISTILLED.md` (or list the
-   `*.md` entry files in `~/.claudesync/distilled/`, ignoring `DISTILLED.md`
-   itself). Reading there should not prompt if `claude-memsync init` installed
-   the allow-rule.
+1. **Read the catalog.** List the `*.md` entry files directly in
+   `~/.claudesync/distilled/` (ignore `DISTILLED.md` itself) — that's the
+   authoritative set, so you don't depend on the index existing. Optionally run
+   `claude-memsync distill` first to refresh the index, but treat it as
+   best-effort: if the binary isn't found, skip it and read the entry files
+   anyway. If `~/.claudesync/distilled/` doesn't exist or is empty, tell the user
+   there's nothing to apply yet (run `/distill` in a project first) and stop.
 
 2. **Diff against this project.** Read the current project's memory directory
    (`~/.claude/projects/<hash>/memory/`, the path in the memory system-reminder).
