@@ -1,0 +1,21 @@
+#!/bin/sh
+# Pre-commit hook: block the commit if any staged Go file is not gofmt-clean.
+#
+# Enable once per clone:
+#     git config core.hooksPath .githooks
+#
+# This mirrors the CI gofmt check so formatting failures surface locally
+# instead of after a push. It only inspects staged Go files, so it stays fast.
+
+# Added/Copied/Modified staged .go files (skip deletions).
+gofiles=$(git diff --cached --name-only --diff-filter=ACM -- '*.go')
+[ -z "$gofiles" ] && exit 0
+
+unformatted=$(gofmt -l $gofiles)
+if [ -n "$unformatted" ]; then
+	echo "gofmt: these staged files are not formatted:" >&2
+	echo "$unformatted" | sed 's/^/  /' >&2
+	echo "" >&2
+	echo "Fix with:  gofmt -w $unformatted" >&2
+	exit 1
+fi

@@ -54,6 +54,21 @@ Full instructions:
 | `internal/proc` | Cross-platform helper that hides child-process console windows on Windows |
 | `internal/version` | Version resolution from `-ldflags` override or embedded VCS info |
 | `skills/` | `/distill` and `/distill-apply` Claude Code skills |
+| `.githooks/` | Shared git hooks (pre-commit gofmt check) |
+
+## Development
+
+The repo ships a pre-commit hook that runs the same `gofmt` check as CI, so
+formatting problems surface locally instead of after a push. Enable it once per
+clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+It only inspects staged `.go` files and blocks the commit if any are not
+gofmt-clean, printing the `gofmt -w …` command to fix them. (`go vet` and the
+test suite stay in CI, which runs them across Linux/macOS/Windows.)
 
 ## Releasing
 
