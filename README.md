@@ -166,6 +166,9 @@ PCs with no extra transport. `DISTILLED.md` itself is a derived artifact: it is
 git-ignored and regenerated locally on each PC (this avoids merge conflicts on
 the generated table).
 
+For a step-by-step walkthrough, see
+[docs/distilling-memories.md](docs/distilling-memories.md).
+
 ### Installing the skills
 
 The skills ship in this repo under `skills/`. Copy them to your user scope so
