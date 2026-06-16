@@ -164,9 +164,25 @@ func bootstrap(cfg config.Config, force bool) error {
 	fmt.Fprintln(os.Stderr, "init OK")
 	fmt.Fprintln(os.Stderr, "  sync dir:        ", cfg.SyncDir)
 	fmt.Fprintln(os.Stderr, "  claude projects: ", cfg.ClaudeProjectsDir)
+	fmt.Fprintln(os.Stderr, "  distilled:       ", cfg.DistilledPath())
 	fmt.Fprintln(os.Stderr, "  remote:          ", cfg.RemoteURL)
 	fmt.Fprintln(os.Stderr, "  merge driver:    ", cfg.MergeDriverPath)
+	printDistillPermissionHint(cfg)
 	return nil
+}
+
+// printDistillPermissionHint suggests the one-time Claude Code permission rule
+// that lets the /distill and /distill-apply skills read and write the shared
+// catalog without prompting under default (non-bypass) permissions. We only
+// advise — editing the user's global settings.json is left to them (or the
+// update-config skill), since it is theirs to own.
+func printDistillPermissionHint(cfg config.Config) {
+	dir := filepath.ToSlash(cfg.DistilledPath())
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "To let the /distill skills use the catalog without permission prompts,")
+	fmt.Fprintln(os.Stderr, "add this to ~/.claude/settings.json (permissions.allow):")
+	fmt.Fprintf(os.Stderr, "  \"Read(%s/**)\",\n", dir)
+	fmt.Fprintf(os.Stderr, "  \"Write(%s/**)\"\n", dir)
 }
 
 // tryClone attempts `git clone <url> <dir>`. Returns (true, nil) on success,
@@ -197,6 +213,9 @@ daemon.pid
 .state/
 *.tmp
 *.from-remote-*
+# Distilled catalog index is a derived artifact; each PC regenerates it locally
+# from the synced entry files (avoids merge conflicts on the generated table).
+distilled/DISTILLED.md
 `
 	return os.WriteFile(path, []byte(content), 0600)
 }

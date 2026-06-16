@@ -121,7 +121,75 @@ credential vault and SSH keys. None require root.
 | `claude-memsync stop` | Stop the running daemon. |
 | `claude-memsync status` | Print `running (pid N)` or `stopped`. |
 | `claude-memsync run` | Run in the foreground (for debugging). |
+| `claude-memsync distill` | Rebuild the distilled-memory catalog index (`--prune`, `--dry-run`). |
 | `claude-memsync version` | Print version. |
+
+## Distilling environment memories across projects
+
+Some lessons Claude learns in one project are **transferable** to every project
+— how the shell behaves (e.g. MINGW64 `kubectl cp` is broken; pipe with
+`cat … | kubectl exec -i`), CLI gotchas (`gh issue assign --self` doesn't
+exist), toolchain quirks, your standing preferences. Most memories, though, are
+bound to one repo (its code, services, deploy, branch rules). Distilling lifts
+the transferable ones out of a single project and makes them reusable.
+
+The work is split between judgment (a Claude skill) and mechanics (this binary):
+
+```
+/distill  (skill, Claude)         claude-memsync distill (Go)     /distill-apply (skill, Claude)
+  classify + generalize     ──►   rebuild DISTILLED.md index ──►    copy entries into a project's
+  write catalog entries           prune stale, report worklist      memory/ + MEMORY.md
+  tag originals scope:env               │
+        │                               │
+        └────────── ~/.claudesync/distilled/  (synced like everything else) ──────┘
+```
+
+- **`/distill`** (skill) is the classifier of record. It reviews a project's
+  memories, decides which are environment-level, rewrites them to be
+  project-neutral, writes one `<slug>.md` entry per lesson into
+  `~/.claudesync/distilled/`, and tags each source memory `scope: environment`.
+  Nothing depends on Claude's everyday memory-writer emitting the marker — the
+  skill is where the decision is made and recorded.
+- **`claude-memsync distill`** is the mechanical half. It cannot classify; it
+  regenerates the human-readable `DISTILLED.md` index from the entry files, and
+  with `--prune` removes entries whose source memory lost the marker or was
+  deleted. The daemon runs this automatically after every sync, so the catalog
+  stays fresh as entries arrive from other workstations. `--dry-run` reports the
+  worklist (marked-but-not-yet-distilled memories) and any conflicts without
+  writing.
+- **`/distill-apply`** (skill) seeds chosen catalog entries into the **current**
+  project's memory. Run it from inside whatever project — new or existing — you
+  want to bring up to speed.
+
+The catalog lives inside the sync work-tree, so entries propagate across your
+PCs with no extra transport. `DISTILLED.md` itself is a derived artifact: it is
+git-ignored and regenerated locally on each PC (this avoids merge conflicts on
+the generated table).
+
+### Installing the skills
+
+The skills ship in this repo under `skills/`. Copy them to your user scope so
+they're available in every project:
+
+```sh
+cp -r skills/distill skills/distill-apply ~/.claude/skills/
+```
+
+### Permissions
+
+The skills read and write `~/.claudesync/distilled/` from inside arbitrary
+projects, which prompts under default (non-bypass) permissions. `claude-memsync
+init` prints a one-time allow-rule to add to `~/.claude/settings.json`:
+
+```jsonc
+{ "permissions": { "allow": [
+  "Read(~/.claudesync/distilled/**)",
+  "Write(~/.claudesync/distilled/**)"
+] } }
+```
+
+(`init` only *prints* it — editing your global settings is left to you or the
+`update-config` skill.)
 
 ## How it works
 
@@ -170,6 +238,8 @@ or when there are unpushed commits.
 - `~/.claudesync/config.json` — per-PC (paths embed your machine layout)
 - `~/.claudesync/.state/manifest.json` — per-PC (delete-detection state)
 - `~/.claudesync/daemon.pid` — runtime state
+- `~/.claudesync/distilled/DISTILLED.md` — derived index, regenerated per-PC
+  (the distilled `<slug>.md` entry files themselves **are** synced)
 
 If you want any of the additional `~/.claude/` content synced, that's a
 future enhancement.

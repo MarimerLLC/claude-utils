@@ -14,6 +14,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/MarimerLLC/claude-utils/internal/config"
+	"github.com/MarimerLLC/claude-utils/internal/distill"
 	"github.com/MarimerLLC/claude-utils/internal/gitwt"
 )
 
@@ -91,6 +92,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		l.OnFlush(true, nil)
 	}
 	l.refreshManifest(roots)
+	l.rebuildDistilledIndex()
 
 	for {
 		select {
@@ -124,6 +126,7 @@ func (l *Loop) Run(ctx context.Context) error {
 				log.Println("flush (local):", err)
 			}
 			l.refreshManifest(roots)
+			l.rebuildDistilledIndex()
 			if l.OnFlush != nil {
 				l.OnFlush(true, err)
 			}
@@ -151,6 +154,7 @@ func (l *Loop) Run(ctx context.Context) error {
 				log.Println("flush (pull):", err)
 			}
 			l.refreshManifest(roots)
+			l.rebuildDistilledIndex()
 			if l.OnFlush != nil {
 				l.OnFlush(false, err)
 			}
@@ -358,6 +362,24 @@ func (l *Loop) refreshManifest(roots Roots) {
 	}
 	if err := m.Save(l.Cfg.SyncDir); err != nil {
 		log.Println("save manifest:", err)
+	}
+}
+
+// rebuildDistilledIndex regenerates the local DISTILLED.md catalog index from
+// the synced entry files. The index is a derived, git-ignored artifact, so this
+// never affects the sync repo; it just keeps the local index fresh after entries
+// arrive (from the /distill skill locally or via a pull). Best-effort: a missing
+// catalog dir is skipped and errors are logged, never fatal.
+func (l *Loop) rebuildDistilledIndex() {
+	dir := l.Cfg.DistilledPath()
+	if _, err := os.Stat(dir); err != nil {
+		return // no catalog on this PC yet
+	}
+	if _, err := distill.BuildIndex(distill.Options{
+		ProjectsDir:  l.Cfg.ClaudeProjectsDir,
+		DistilledDir: dir,
+	}); err != nil {
+		log.Println("rebuild distilled index:", err)
 	}
 }
 
