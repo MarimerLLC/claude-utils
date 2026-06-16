@@ -46,9 +46,9 @@ automatically.
 
 You only do this once per machine.
 
-1. **Build and install the binaries** (see the main README for the full sync
-   setup). You need `claude-memsync` on your PATH and a `claude-memsync init`
-   already run.
+1. **Build and install the binaries** (see
+   [claude-memsync.md](claude-memsync.md) for the full sync setup). You need
+   `claude-memsync` on your PATH and a `claude-memsync init` already run.
 
 2. **Install the skills** to your user scope so they work in every project:
 

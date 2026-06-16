@@ -4,325 +4,41 @@
 
 Cross-workstation tooling for Claude Code.
 
-## claude-memsync
+Two capabilities, both built from a single pair of Go binaries
+(`claude-memsync` + `claude-memmerge`) that run on Windows, Linux, and macOS:
 
-Background daemon that keeps `~/.claude/projects/<project-hash>/memory/`
-in sync across multiple workstations using a private git repository as
-transport. A custom git merge driver (`claude-memmerge`) unions
-`MEMORY.md` section blocks instead of producing line-level conflicts.
-Single Go binary; runs on Windows, Linux, and macOS.
+- **[claude-memsync](docs/claude-memsync.md)** — a background daemon that keeps
+  your Claude Code memories (`~/.claude/projects/<hash>/memory/`) in sync across
+  multiple workstations, using a private git repository as transport. A custom
+  merge driver unions `MEMORY.md` section blocks instead of producing line-level
+  conflicts.
+- **[Distilling environment memories](docs/distilling-memories.md)** — lift the
+  *transferable* lessons (shell/OS quirks, CLI gotchas, toolchain, your standing
+  preferences) out of one project and reuse them in any other, existing or new,
+  via a shared catalog and two Claude skills (`/distill`, `/distill-apply`).
 
-## Prerequisites
-
-- Go 1.23+ to build
-- `git` 2.x on PATH at runtime (the daemon shells out)
-- A private git remote you can `git push` to from your terminal — the
-  daemon inherits your normal git credentials (Git Credential Manager on
-  Windows, SSH agent or `~/.gitconfig` credential helpers on Linux/macOS).
-  Confirm `git push` works against the remote before installing.
-- The same project paths on each PC (we use Claude's project-hash
-  directory names, which are derived from absolute paths). If your repos
-  live at the same drive letter / mount point on every PC, you're set.
-
-## Setup
-
-### 1. Create the private remote (once, from any PC)
-
-Any empty private git repo works. With the GitHub CLI:
+## Quick start
 
 ```sh
-gh repo create <you>/claude-sync --private --description "Private Claude Code memory sync"
-```
-
-### 2. Build (each PC)
-
-```sh
+# Build both binaries (they must end up in the same directory)
 git clone https://github.com/MarimerLLC/claude-utils.git
 cd claude-utils
 go build -o bin/ ./cmd/...
-```
 
-For a release build that stamps the version into the binary:
-
-```sh
-VERSION=$(git describe --tags --always --dirty)
-go build -ldflags "-X github.com/MarimerLLC/claude-utils/internal/version.Override=$VERSION" -o bin/ ./cmd/...
-```
-
-A plain `go build` (no ldflags) still produces a working binary —
-`claude-memsync version` falls back to the VCS revision Go embeds
-automatically (e.g. `dev+a52d68609b6e`).
-
-Both binaries (`claude-memsync` and `claude-memmerge`) end up in `bin/`.
-**They must live in the same directory** — `claude-memsync` finds the
-merge driver as a sibling. Move both to a stable location if you don't
-want them tied to the source checkout, e.g.:
-
-- Windows: `C:\Program Files\claude-memsync\` (or anywhere on PATH)
-- Linux/macOS: `~/.local/bin/`
-
-### 3. Initialize the local sync repo (each PC)
-
-```sh
+# Bootstrap and run the sync daemon (per PC)
 claude-memsync init --remote https://github.com/<you>/claude-sync.git
-```
-
-This:
-
-- Clones the remote into `~/.claudesync/`
-- Configures the `MEMORY.md` merge driver in the local git config
-- Mirrors any existing `~/.claude/projects/<hash>/memory/` content into
-  the work-tree
-- Writes `~/.claudesync/config.json` (per-PC; never synced)
-- Writes `~/.claudesync/.state/manifest.json` (per-PC; never synced)
-- Pushes the seed commit if this is the first PC
-
-On a second or third PC where the remote already has content from
-another workstation, init handles collisions:
-
-- `MEMORY.md` present on both sides → semantic merge (sections from
-  both PCs are unioned)
-- Other memory files differing on both sides → mirror copy is preserved
-  as `<name>.from-remote-<random>` for manual review; the local version
-  is taken
-
-### 4. Install and start the daemon (each PC)
-
-```sh
 claude-memsync install
 claude-memsync start
-claude-memsync status
 ```
 
-`install` registers the daemon to auto-start when you log in:
+Full instructions:
 
-- **Windows**: drops `claude-memsync.vbs` in
-  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`. The script
-  launches the daemon hidden and detached via `WScript.Shell.Run`, so no
-  console window is left behind at logon. No admin required. (Task
-  Scheduler was investigated; it requires admin even for per-user logon
-  tasks, so the Startup folder is the simpler path.)
-- **Linux**: writes a systemd user unit at
-  `~/.config/systemd/user/claude-memsync.service` and enables it.
-- **macOS**: writes a launchd plist at
-  `~/Library/LaunchAgents/claude-memsync.plist`.
-
-All three run as your logged-in user, with full access to your
-credential vault and SSH keys. None require root.
-
-## Lifecycle commands
-
-| Command | What it does |
-|---|---|
-| `claude-memsync init --remote <url>` | One-time bootstrap. |
-| `claude-memsync install` | Register for auto-start at next logon. |
-| `claude-memsync uninstall` | Remove the auto-start hook. |
-| `claude-memsync start` | Start the daemon now. |
-| `claude-memsync stop` | Stop the running daemon. |
-| `claude-memsync status` | Print `running (pid N)` or `stopped`. |
-| `claude-memsync run` | Run in the foreground (for debugging). |
-| `claude-memsync distill` | Rebuild the distilled-memory catalog index (`--prune`, `--dry-run`). |
-| `claude-memsync version` | Print version. |
-
-## Distilling environment memories across projects
-
-Some lessons Claude learns in one project are **transferable** to every project
-— how the shell behaves (e.g. MINGW64 `kubectl cp` is broken; pipe with
-`cat … | kubectl exec -i`), CLI gotchas (`gh issue assign --self` doesn't
-exist), toolchain quirks, your standing preferences. Most memories, though, are
-bound to one repo (its code, services, deploy, branch rules). Distilling lifts
-the transferable ones out of a single project and makes them reusable.
-
-The work is split between judgment (a Claude skill) and mechanics (this binary):
-
-```
-/distill  (skill, Claude)         claude-memsync distill (Go)     /distill-apply (skill, Claude)
-  classify + generalize     ──►   rebuild DISTILLED.md index ──►    copy entries into a project's
-  write catalog entries           prune stale, report worklist      memory/ + MEMORY.md
-  tag originals scope:env               │
-        │                               │
-        └────────── ~/.claudesync/distilled/  (synced like everything else) ──────┘
-```
-
-- **`/distill`** (skill) is the classifier of record. It reviews a project's
-  memories, decides which are environment-level, rewrites them to be
-  project-neutral, writes one `<slug>.md` entry per lesson into
-  `~/.claudesync/distilled/`, and tags each source memory `scope: environment`.
-  Nothing depends on Claude's everyday memory-writer emitting the marker — the
-  skill is where the decision is made and recorded.
-- **`claude-memsync distill`** is the mechanical half. It cannot classify; it
-  regenerates the human-readable `DISTILLED.md` index from the entry files, and
-  with `--prune` removes entries whose source memory lost the marker or was
-  deleted. The daemon runs this automatically after every sync, so the catalog
-  stays fresh as entries arrive from other workstations. `--dry-run` reports the
-  worklist (marked-but-not-yet-distilled memories) and any conflicts without
-  writing.
-- **`/distill-apply`** (skill) seeds chosen catalog entries into the **current**
-  project's memory. Run it from inside whatever project — new or existing — you
-  want to bring up to speed.
-
-The catalog lives inside the sync work-tree, so entries propagate across your
-PCs with no extra transport. `DISTILLED.md` itself is a derived artifact: it is
-git-ignored and regenerated locally on each PC (this avoids merge conflicts on
-the generated table).
-
-For a step-by-step walkthrough, see
-[docs/distilling-memories.md](docs/distilling-memories.md).
-
-### Installing the skills
-
-The skills ship in this repo under `skills/`. Copy them to your user scope so
-they're available in every project:
-
-```sh
-cp -r skills/distill skills/distill-apply ~/.claude/skills/
-```
-
-### Permissions
-
-The skills read and write `~/.claudesync/distilled/` from inside arbitrary
-projects, which prompts under default (non-bypass) permissions. `claude-memsync
-init` prints a one-time allow-rule to add to `~/.claude/settings.json`:
-
-```jsonc
-{ "permissions": { "allow": [
-  "Read(~/.claudesync/distilled/**)",
-  "Write(~/.claudesync/distilled/**)"
-] } }
-```
-
-(`init` only *prints* it — editing your global settings is left to you or the
-`update-config` skill.)
-
-## How it works
-
-```
-~/.claude/projects/<hash>/memory/         (Claude reads + writes here — authoritative)
-                  │
-                  │  fsnotify watcher, 3s debounce
-                  ▼
-~/.claudesync/projects/<hash>/memory/     (mirror — git work-tree)
-                  │
-                  │  git add -A, commit, pull --rebase, push
-                  ▼
-                <remote>                  (private GitHub repo)
-                  │
-                  │  ls-remote check on 1h timer (or after local push);
-                  │  full pull only when remote SHA actually moved
-                  ▼
-   propagate pull-driven changes back to ~/.claude/projects/...
-```
-
-Idle ticks cost a single `git ls-remote` round-trip — no pull, no push,
-no merge driver invocation. The full pull/push cycle runs only when
-origin's branch SHA differs from the local `refs/remotes/origin/<branch>`
-or when there are unpushed commits.
-
-- The daemon never edits files in `~/.claude/projects/...` while a write
-  is in progress — it copies into the mirror first, then any inbound
-  changes from a `git pull` are written back atomically.
-- The custom merge driver is registered in the local repo config and
-  invoked by git via `.gitattributes` (`MEMORY.md merge=claude-memory-index`).
-- Conflicts in non-`MEMORY.md` files surface as standard git conflict
-  markers in the affected file. Rare in practice because each memory
-  file has a unique filename per topic.
-
-## What gets synced (and what doesn't)
-
-**Synced:** every file directly under
-`~/.claude/projects/<project-hash>/memory/` on any PC.
-
-**Not synced:**
-
-- `~/.claude/CLAUDE.md` (your global instructions)
-- `~/.claude/agents/`, `~/.claude/commands/`, `~/.claude/skills/`
-- `~/.claude/sessions/`, `~/.claude/todos/`, `~/.claude/cache/`,
-  `~/.claude/history.jsonl`, `~/.claude/settings.json`, etc.
-- `~/.claudesync/config.json` — per-PC (paths embed your machine layout)
-- `~/.claudesync/.state/manifest.json` — per-PC (delete-detection state)
-- `~/.claudesync/daemon.pid` — runtime state
-- `~/.claudesync/distilled/DISTILLED.md` — derived index, regenerated per-PC
-  (the distilled `<slug>.md` entry files themselves **are** synced)
-
-If you want any of the additional `~/.claude/` content synced, that's a
-future enhancement.
-
-## Deletes
-
-Deletes propagate across PCs. The daemon keeps a per-PC manifest
-(`~/.claudesync/.state/manifest.json`) listing which Claude-side memory
-files were present at the last successful sync. On each reconcile pass,
-a file that's in the mirror, missing from Claude, **and** was in the
-manifest is treated as a user delete and removed from the mirror; the
-next push propagates it. A file that's in the mirror, missing from
-Claude, but **not** in the manifest is treated as an inbound new file
-from another PC and copied into Claude.
-
-This means:
-
-- Delete a memory while the daemon is running → propagates immediately
-  (watcher catches it).
-- Delete a memory while the daemon is stopped → propagates on next
-  startup (manifest-driven reconcile).
-- First-ever run on a PC has no manifest, so deletes can't be inferred
-  from prior state. The daemon takes the safe path: never infer deletes,
-  bring everything together. Subsequent runs work normally.
-
-## On-disk layout
-
-```
-~/.claude/projects/<hash>/memory/         # what Claude reads + writes
-    ├── MEMORY.md
-    └── <topic>.md ...
-
-~/.claudesync/                            # owned by the daemon
-    ├── config.json                       # per-PC (gitignored)
-    ├── daemon.pid                        # per-PC (gitignored)
-    ├── .git/                             # the sync repo
-    ├── .gitattributes                    # MEMORY.md merge=claude-memory-index
-    ├── .gitignore                        # excludes config.json, .state/, etc.
-    ├── .state/manifest.json              # per-PC delete-detection state
-    └── projects/<hash>/memory/...        # git work-tree mirror
-```
-
-## Auth notes
-
-The daemon shells out to the system `git` binary, so it uses whatever
-auth is configured in your environment:
-
-- **HTTPS with Git Credential Manager** (`gh auth login` on Windows
-  populates this): zero extra setup.
-- **SSH**: ensure `ssh-agent` is running for your user session and your
-  key is loaded. On Linux, `systemctl --enable-linger <user>` keeps the
-  user instance running across logoffs if you want sync activity while
-  not logged in.
-- **PAT in URL** (`https://<token>@github.com/...`): works but the token
-  ends up in `~/.claudesync/.git/config`. Not recommended.
-
-Test before installing the daemon:
-```sh
-git -C ~/.claudesync push
-```
-If that works without prompting, the daemon will too.
-
-## Limitations / known issues
-
-- **Path consistency required**: Claude derives the per-project memory
-  directory name by escaping the project's absolute path. PCs that
-  open the same repo at different paths (e.g. `C:\src\foo` vs.
-  `D:\dev\foo`) will see them as different projects.
-- **No live conflict UI**: when the merge driver emits actual conflict
-  markers (rare; only on overlapping line edits within the same
-  `MEMORY.md` section body), the file is committed and pushed with
-  markers. The next time you edit on that PC you'll see them; resolve
-  by hand and save.
-- **Auto-start runs while logged in**: the daemon stops when the user
-  logs off. Acceptable since memories don't change while you're away.
-  For 24/7 sync, register a system-wide service manually or enable
-  systemd lingering.
-- **Stop is a hard kill**: by design — git operations are atomic per
-  command, so we don't risk corruption. If a `.git/index.lock` is left
-  behind by an unrelated git crash, remove it manually.
+- **Syncing memories across machines** → [docs/claude-memsync.md](docs/claude-memsync.md)
+  (prerequisites, setup, lifecycle commands, how it works, deletes, auth,
+  limitations).
+- **Distilling lessons across projects** → [docs/distilling-memories.md](docs/distilling-memories.md)
+  (installing the skills, the `/distill` and `/distill-apply` workflows,
+  permissions, troubleshooting).
 
 ## Project layout
 
@@ -332,10 +48,12 @@ If that works without prompting, the daemon will too.
 | `cmd/claude-memmerge` | Git custom merge driver for `MEMORY.md` |
 | `internal/sync` | Mirror, reconcile, watcher loop, manifest |
 | `internal/merge` | Section-block parser + 3-way semantic merge |
+| `internal/distill` | Distilled-memory catalog index + reconcile |
 | `internal/gitwt` | Wrapper around the `git` CLI scoped to the sync work-tree |
 | `internal/config` | Config load/save (`~/.claudesync/config.json`) |
 | `internal/proc` | Cross-platform helper that hides child-process console windows on Windows |
 | `internal/version` | Version resolution from `-ldflags` override or embedded VCS info |
+| `skills/` | `/distill` and `/distill-apply` Claude Code skills |
 
 ## Releasing
 
