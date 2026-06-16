@@ -14,6 +14,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/MarimerLLC/claude-utils/internal/config"
+	"github.com/MarimerLLC/claude-utils/internal/distill"
 	"github.com/MarimerLLC/claude-utils/internal/gitwt"
 )
 
@@ -91,6 +92,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		l.OnFlush(true, nil)
 	}
 	l.refreshManifest(roots)
+	l.rebuildDistilledIndex()
 
 	for {
 		select {
@@ -124,6 +126,7 @@ func (l *Loop) Run(ctx context.Context) error {
 				log.Println("flush (local):", err)
 			}
 			l.refreshManifest(roots)
+			l.rebuildDistilledIndex()
 			if l.OnFlush != nil {
 				l.OnFlush(true, err)
 			}
@@ -151,6 +154,7 @@ func (l *Loop) Run(ctx context.Context) error {
 				log.Println("flush (pull):", err)
 			}
 			l.refreshManifest(roots)
+			l.rebuildDistilledIndex()
 			if l.OnFlush != nil {
 				l.OnFlush(false, err)
 			}
@@ -361,6 +365,24 @@ func (l *Loop) refreshManifest(roots Roots) {
 	}
 }
 
+// rebuildDistilledIndex regenerates the local DISTILLED.md catalog index from
+// the synced entry files. The index is a derived, git-ignored artifact, so this
+// never affects the sync repo; it just keeps the local index fresh after entries
+// arrive (from the /distill skill locally or via a pull). Best-effort: a missing
+// catalog dir is skipped and errors are logged, never fatal.
+func (l *Loop) rebuildDistilledIndex() {
+	dir := l.Cfg.DistilledPath()
+	if _, err := os.Stat(dir); err != nil {
+		return // no catalog on this PC yet
+	}
+	if _, err := distill.BuildIndex(distill.Options{
+		ProjectsDir:  l.Cfg.ClaudeProjectsDir,
+		DistilledDir: dir,
+	}); err != nil {
+		log.Println("rebuild distilled index:", err)
+	}
+}
+
 // shouldIgnoreFile returns true for filenames the daemon should not sync.
 func shouldIgnoreFile(name string) bool {
 	if name == "" {
@@ -369,7 +391,11 @@ func shouldIgnoreFile(name string) bool {
 	if strings.HasPrefix(name, ".") {
 		return true
 	}
-	if strings.HasSuffix(name, ".tmp") {
+	// Atomic-write temp files: a trailing ".tmp", or the
+	// "<name>.tmp.<pid>.<hash>" form left behind by interrupted memory writes
+	// (the pid-suffixed variant does not end in ".tmp", so the suffix check
+	// alone misses it). Neither is a real memory; they must never sync.
+	if strings.HasSuffix(name, ".tmp") || strings.Contains(name, ".tmp.") {
 		return true
 	}
 	return false

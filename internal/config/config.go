@@ -30,6 +30,11 @@ type Config struct {
 	// Defaults to a sibling of the running daemon.
 	MergeDriverPath string `json:"mergeDriverPath"`
 
+	// DistilledDir holds the shared catalog of environment-level memories.
+	// Empty means <SyncDir>/distilled (see DistilledPath). It lives inside the
+	// work-tree so the daemon's git sync carries it across workstations.
+	DistilledDir string `json:"distilledDir,omitempty"`
+
 	// DebounceMs is how long to wait after a file change before committing.
 	DebounceMs int `json:"debounceMs"`
 
@@ -71,6 +76,15 @@ func DiscoverMergeDriver() (string, error) {
 // Path returns the absolute path to the config file inside SyncDir.
 func (c Config) Path() string {
 	return filepath.Join(c.SyncDir, "config.json")
+}
+
+// DistilledPath returns the distilled-memory catalog directory, defaulting to
+// <SyncDir>/distilled when DistilledDir is unset.
+func (c Config) DistilledPath() string {
+	if c.DistilledDir != "" {
+		return c.DistilledDir
+	}
+	return filepath.Join(c.SyncDir, "distilled")
 }
 
 // Load reads the config from path. The path is typically Config.Path() but

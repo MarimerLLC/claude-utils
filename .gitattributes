@@ -1,0 +1,17 @@
+# Keep the repository normalized to LF on every platform. Go, shell, and
+# markdown all tolerate LF on Windows, and a synced-across-workstations project
+# benefits from deterministic line endings regardless of each PC's autocrlf.
+* text=auto eol=lf
+
+# Windows launchers must be CRLF if ever committed (the daemon generates the
+# .vbs launcher at runtime, so none are tracked today — this is a guardrail).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets: never normalize.
+*.png binary
+*.ico binary
+*.gz binary
+*.zip binary
