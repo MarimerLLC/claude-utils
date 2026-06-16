@@ -47,8 +47,24 @@ automatically.
 You only do this once per machine.
 
 1. **Build and install the binaries** (see
-   [claude-memsync.md](claude-memsync.md) for the full sync setup). You need
-   `claude-memsync` on your PATH and a `claude-memsync init` already run.
+   [claude-memsync.md](claude-memsync.md) for the full sync setup), and make sure
+   `claude-memsync` is **on your PATH**, with a `claude-memsync init` already run.
+
+   The PATH part matters: `/distill` calls `claude-memsync distill` to rebuild
+   the catalog index. If the binary isn't found, the skill degrades gracefully
+   (it still writes entries and lets the daemon rebuild the index later) — but to
+   get the index refreshed immediately, `claude-memsync` must resolve. Move the
+   binary somewhere on PATH (`~/.local/bin`, `C:\Program Files\claude-memsync\`,
+   …), or if you're running it straight out of a dev checkout, drop a small
+   forwarding shim on PATH, e.g. `~/.local/bin/claude-memsync`:
+
+   ```sh
+   #!/usr/bin/env bash
+   exec "/path/to/checkout/bin/claude-memsync.exe" "$@"
+   ```
+
+   (`chmod +x` it. A shim avoids a stale duplicate — it always runs your current
+   build.)
 
 2. **Install the skills** to your user scope so they work in every project:
 
