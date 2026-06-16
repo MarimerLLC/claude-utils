@@ -218,6 +218,7 @@ config.json
 daemon.pid
 .state/
 *.tmp
+*.tmp.*
 *.from-remote-*
 # Distilled catalog index is a derived artifact; each PC regenerates it locally
 # from the synced entry files (avoids merge conflicts on the generated table).

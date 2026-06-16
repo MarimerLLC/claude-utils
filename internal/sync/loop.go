@@ -391,7 +391,11 @@ func shouldIgnoreFile(name string) bool {
 	if strings.HasPrefix(name, ".") {
 		return true
 	}
-	if strings.HasSuffix(name, ".tmp") {
+	// Atomic-write temp files: a trailing ".tmp", or the
+	// "<name>.tmp.<pid>.<hash>" form left behind by interrupted memory writes
+	// (the pid-suffixed variant does not end in ".tmp", so the suffix check
+	// alone misses it). Neither is a real memory; they must never sync.
+	if strings.HasSuffix(name, ".tmp") || strings.Contains(name, ".tmp.") {
 		return true
 	}
 	return false
