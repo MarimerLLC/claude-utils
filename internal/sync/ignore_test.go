@@ -4,11 +4,11 @@ import "testing"
 
 func TestShouldIgnoreFile(t *testing.T) {
 	ignore := []string{
-		"",                                                // empty
-		".hidden",                                         // dot-prefixed
-		".gitignore",                                      // dot-prefixed
-		"MEMORY.md.tmp",                                   // trailing .tmp
-		"MEMORY.md.tmp.7368.beeb3e905e2a",                 // <name>.tmp.<pid>.<hash>
+		"",                                // empty
+		".hidden",                         // dot-prefixed
+		".gitignore",                      // dot-prefixed
+		"MEMORY.md.tmp",                   // trailing .tmp
+		"MEMORY.md.tmp.7368.beeb3e905e2a", // <name>.tmp.<pid>.<hash>
 		"feedback_mingw_kubectl.md.tmp.27244.fac4861e524", // same, real-world shape
 		"release_process.md.tmp.47284.4cad.from-remote-1", // temp + conflict-backup suffix
 	}
