@@ -102,7 +102,13 @@ func bootstrap(cfg config.Config, force bool) error {
 	if err := repo.ConfigSet(fmt.Sprintf("merge.%s.name", mergeDriverName), "claude memory index merge"); err != nil {
 		return err
 	}
-	driverCmd := fmt.Sprintf("%s %%O %%A %%B %%L %%P", quoteIfSpaces(cfg.MergeDriverPath))
+	// Use forward slashes in the driver path: git invokes the driver command
+	// through its bundled sh, which treats backslashes as escapes — a Windows
+	// path like S:\src\...\claude-memmerge.exe would be mangled to
+	// S:srcclaude-memmerge.exe ("command not found"), silently disabling the
+	// MEMORY.md union merge. Forward slashes work for Windows exe invocation and
+	// survive sh unquoted or quoted.
+	driverCmd := fmt.Sprintf("%s %%O %%A %%B %%L %%P", quoteIfSpaces(filepath.ToSlash(cfg.MergeDriverPath)))
 	if err := repo.ConfigSet(fmt.Sprintf("merge.%s.driver", mergeDriverName), driverCmd); err != nil {
 		return err
 	}
