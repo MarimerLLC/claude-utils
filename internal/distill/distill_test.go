@@ -153,9 +153,11 @@ func TestBuildIndexPendingWorklist(t *testing.T) {
 	projects := filepath.Join(dir, "projects")
 	distilled := filepath.Join(dir, "distilled")
 
-	// A marked memory already in the catalog.
-	writeFile(t, filepath.Join(projects, "P1", "memory", "in-catalog.md"), sourceMemory("in-catalog", true, "x"))
-	writeFile(t, filepath.Join(distilled, "in-catalog.md"), catalogEntry("in-catalog", "d", "feedback", "P1", "in-catalog.md", "x"))
+	// A marked memory already in the catalog. The source keeps a human-readable
+	// name while the catalog entry uses a normalized slug — they must still match
+	// by provenance (project/file), NOT by name, or the entry mis-reports pending.
+	writeFile(t, filepath.Join(projects, "P1", "memory", "in-catalog.md"), sourceMemory("In Catalog, Human Name", true, "x"))
+	writeFile(t, filepath.Join(distilled, "in-catalog.md"), catalogEntry("in-catalog-slug", "d", "feedback", "P1", "in-catalog.md", "x"))
 	// A marked memory NOT yet in the catalog -> pending.
 	writeFile(t, filepath.Join(projects, "P1", "memory", "pending.md"), sourceMemory("pending-lesson", true, "y"))
 	// An unmarked memory -> ignored.

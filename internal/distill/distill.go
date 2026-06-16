@@ -254,9 +254,15 @@ func loadEntry(path string) (Entry, error) {
 // multiple sources with divergent bodies (conflicts). Unreadable trees yield
 // empty results rather than errors.
 func analyzeSources(opts Options, catalog []Entry) ([]Origin, []Conflict) {
-	inCatalog := make(map[string]bool, len(catalog))
+	// A catalog entry claims its source by provenance (project/file), not by
+	// name: the catalog slug is normalized and deliberately differs from the
+	// source memory's human-readable name, so matching on name would mis-report
+	// every renamed entry as pending.
+	claimed := make(map[string]bool, len(catalog))
 	for _, e := range catalog {
-		inCatalog[e.Name] = true
+		if e.OriginProject != "" && e.OriginFile != "" {
+			claimed[e.OriginProject+"/"+e.OriginFile] = true
+		}
 	}
 
 	dirs, err := os.ReadDir(opts.ProjectsDir)
@@ -268,6 +274,7 @@ func analyzeSources(opts Options, catalog []Entry) ([]Origin, []Conflict) {
 		origin Origin
 		hash   string
 	}
+	var all []src
 	byName := map[string][]src{}
 	for _, d := range dirs {
 		if !d.IsDir() {
@@ -295,23 +302,41 @@ func analyzeSources(opts Options, catalog []Entry) ([]Origin, []Conflict) {
 			if name == "" {
 				name = strings.TrimSuffix(f.Name(), ".md")
 			}
-			byName[name] = append(byName[name], src{
+			s := src{
 				origin: Origin{Project: d.Name(), File: f.Name(), Path: path, Name: name},
 				hash:   bodyHash(body),
-			})
+			}
+			all = append(all, s)
+			byName[name] = append(byName[name], s)
 		}
 	}
 
+	// Pending: a tagged source whose provenance no catalog entry claims yet.
+	var pending []Origin
+	for _, s := range all {
+		if !claimed[s.origin.Project+"/"+s.origin.File] {
+			pending = append(pending, s.origin)
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		if pending[i].Project != pending[j].Project {
+			return pending[i].Project < pending[j].Project
+		}
+		return pending[i].File < pending[j].File
+	})
+
+	// Conflicts: the same name carried by multiple sources with divergent bodies.
 	names := make([]string, 0, len(byName))
 	for n := range byName {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-
-	var pending []Origin
 	var conflicts []Conflict
 	for _, n := range names {
 		ss := byName[n]
+		if len(ss) < 2 {
+			continue
+		}
 		hashes := map[string]bool{}
 		var labels []string
 		for _, s := range ss {
@@ -320,9 +345,6 @@ func analyzeSources(opts Options, catalog []Entry) ([]Origin, []Conflict) {
 		}
 		if len(hashes) > 1 {
 			conflicts = append(conflicts, Conflict{Name: n, Sources: labels})
-		}
-		if !inCatalog[n] {
-			pending = append(pending, ss[0].origin)
 		}
 	}
 	return pending, conflicts

@@ -65,16 +65,27 @@ prompts. In particular:
    When unsure, choose **project**. A false promotion pollutes every other
    project's context; a missed one just stays put until next time.
 
+   **The cross-stack test (use it especially for `type: reference`):** ask
+   *"would this still help in a project on a completely different tech stack?"*
+   Shell/OS/CLI gotchas and your standing preferences pass — they're true
+   regardless of language or framework. A fact about a specific library,
+   framework, or pinned version (e.g. "in Microsoft.Extensions.AI 10.3.0, cached
+   tokens moved to property X") **fails** — it's noise in a project that doesn't
+   use that dependency, so it stays **project**-scoped even though it's
+   technically "transferable" to other repos using the same library. Distill the
+   environment, not the tech stack.
+
 4. **Generalize** each environment memory before promoting it. Strip residual
    project specifics — replace a `rockbot`-specific pod selector or path with a
    generic placeholder or example, drop framing like "in this repo" — while
    preserving the transferable rule and a usable example. The catalog entry must
    read as advice for *any* project.
 
-5. **Write the catalog entry** to `~/.claudesync/distilled/<slug>.md` where
-   `<slug>` is the memory's `name` (run `mkdir -p ~/.claudesync/distilled` first
-   if you're shelling out, or just write the file). Use exactly this frontmatter
-   shape (the daemon's parser reads `metadata.*`):
+5. **Write the catalog entry** to `~/.claudesync/distilled/<slug>.md` (run
+   `mkdir -p ~/.claudesync/distilled` first if you're shelling out, or just write
+   the file). Pick `<slug>` as a short **kebab-case** identifier for the lesson
+   (e.g. `mingw64-kubectl-file-transfer`, `container-image-tag-hygiene`). Use
+   exactly this frontmatter shape (the daemon's parser reads `metadata.*`):
 
    ```markdown
    ---
@@ -89,6 +100,13 @@ prompts. In particular:
 
    <generalized body>
    ```
+
+   **`name` must equal the file's `<slug>`** — a kebab-case identifier, *not* the
+   source memory's human-readable `name` (which is often a full sentence). The
+   filename and the `name` field must match. The source keeps its own name; the
+   link back to the source is `originProject`/`originFile`, which is also how the
+   tooling matches a catalog entry to its origin — so the two names are allowed to
+   differ, but the catalog side must be a clean slug.
 
 6. **Tag the original** in place: add `scope: environment` under its `metadata:`
    block (or as a top-level key if it uses the older flat frontmatter). Leave the
