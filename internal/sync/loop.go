@@ -16,6 +16,7 @@ import (
 	"github.com/MarimerLLC/claude-utils/internal/config"
 	"github.com/MarimerLLC/claude-utils/internal/distill"
 	"github.com/MarimerLLC/claude-utils/internal/gitwt"
+	"github.com/MarimerLLC/claude-utils/internal/project"
 )
 
 // Loop is the long-running daemon body. It watches the Claude memory tree,
@@ -26,6 +27,11 @@ type Loop struct {
 	Branch   string
 	Hostname string
 	OnFlush  func(localChanges bool, err error) // optional, for tests/observability
+
+	// idx maps localHash → fingerprint key for the current Claude tree. Rebuilt
+	// at startup and on the pull tick; filled lazily for projects that appear
+	// mid-session. The loop is single-goroutine, so no locking is needed.
+	idx *project.Index
 }
 
 // Run blocks until ctx is canceled. Returns the first fatal error or nil
@@ -63,6 +69,11 @@ func (l *Loop) Run(ctx context.Context) error {
 		log.Println("refresh memory watches:", err)
 	}
 
+	// A foreground `run` is otherwise silent, which reads as a hang; announce
+	// startup so it's clear the daemon is alive and what it's doing.
+	log.Printf("watching %s → %s (branch %s); pull every %ds. this runs in the foreground — Ctrl-C to stop.",
+		roots.Claude, l.Cfg.RemoteURL, l.Branch, l.Cfg.PullIntervalSec)
+
 	debounce := time.NewTimer(time.Hour)
 	if !debounce.Stop() {
 		<-debounce.C
@@ -73,6 +84,16 @@ func (l *Loop) Run(ctx context.Context) error {
 
 	pendingLocal := false
 
+	// Build the project index and migrate any legacy path-keyed mirror dirs to
+	// fingerprint keys before the first sync, so pre-existing per-machine dirs
+	// collapse to one key (and merge via the driver on the next push/pull).
+	l.rebuildIndex(roots)
+	if rep, err := MigrateLayout(roots, l.idx); err != nil {
+		log.Println("migrate layout:", err)
+	} else if n := len(rep.CopiedToMirror) + len(rep.Merged) + len(rep.BackedUp); n > 0 {
+		log.Printf("migrated legacy mirror dirs to fingerprint keys (%d files)", n)
+	}
+
 	// Initial sync at startup: reconcile local with mirror (using manifest
 	// to detect deletes that happened while the daemon was off), then flush.
 	manifest, err := LoadManifest(l.Cfg.SyncDir)
@@ -80,7 +101,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		log.Println("load manifest (continuing without delete detection):", err)
 		manifest = NewManifest()
 	}
-	if _, err := Reconcile(roots, manifest); err != nil {
+	if _, err := Reconcile(roots, l.idx, manifest); err != nil {
 		log.Println("initial reconcile:", err)
 	}
 	if err := l.flush(repo, roots, true); err != nil {
@@ -93,6 +114,7 @@ func (l *Loop) Run(ctx context.Context) error {
 	}
 	l.refreshManifest(roots)
 	l.rebuildDistilledIndex()
+	log.Printf("initial sync complete; tracking %d project(s). idle until a memory changes.", len(l.idx.All()))
 
 	for {
 		select {
@@ -124,6 +146,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			err := l.flush(repo, roots, true)
 			if err != nil {
 				log.Println("flush (local):", err)
+			} else {
+				log.Println("synced local memory changes")
 			}
 			l.refreshManifest(roots)
 			l.rebuildDistilledIndex()
@@ -146,7 +170,10 @@ func (l *Loop) Run(ctx context.Context) error {
 				log.Println("load manifest:", err)
 				m = NewManifest()
 			}
-			if _, err := Reconcile(roots, m); err != nil {
+			// Refresh the index so projects opened since startup (and any repo
+			// whose remote changed) resolve to the right key before reconciling.
+			l.rebuildIndex(roots)
+			if _, err := Reconcile(roots, l.idx, m); err != nil {
 				log.Println("reconcile:", err)
 			}
 			err = l.flush(repo, roots, true)
@@ -193,17 +220,17 @@ func (l *Loop) handleEvent(watcher *fsnotify.Watcher, roots Roots, ev fsnotify.E
 
 	switch {
 	case ev.Op&(fsnotify.Create|fsnotify.Write) != 0:
-		if err := CopyToMirror(roots, hash, name); err != nil {
+		if err := CopyToMirror(roots, l.idx, hash, name); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				// Race: file vanished between event and read. Treat as remove.
-				return true, RemoveFromMirror(roots, hash, name)
+				return true, RemoveFromMirror(roots, l.idx, hash, name)
 			}
 			return false, fmt.Errorf("copy to mirror %s/%s: %w", hash, name, err)
 		}
 		return true, nil
 
 	case ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0:
-		if err := RemoveFromMirror(roots, hash, name); err != nil {
+		if err := RemoveFromMirror(roots, l.idx, hash, name); err != nil {
 			return false, fmt.Errorf("remove from mirror %s/%s: %w", hash, name, err)
 		}
 		return true, nil
@@ -240,7 +267,7 @@ func (l *Loop) flush(repo *gitwt.Repo, roots Roots, includeLocal bool) error {
 	}
 	postRev, _ := repo.Run("rev-parse", "HEAD")
 	if strings.TrimSpace(preRev) != strings.TrimSpace(postRev) && strings.TrimSpace(preRev) != "" {
-		if err := propagateChanges(repo, roots, strings.TrimSpace(preRev), strings.TrimSpace(postRev)); err != nil {
+		if err := propagateChanges(repo, roots, l.idx, strings.TrimSpace(preRev), strings.TrimSpace(postRev)); err != nil {
 			return fmt.Errorf("propagate: %w", err)
 		}
 	}
@@ -274,13 +301,17 @@ func remoteAndLocalIdle(repo *gitwt.Repo, branch string) (bool, error) {
 	return strings.TrimSpace(unpushed) == "0", nil
 }
 
-// propagateChanges replays the file changes between pre and post revisions
-// from the mirror back into Claude's tree.
-func propagateChanges(repo *gitwt.Repo, roots Roots, pre, post string) error {
+// propagateChanges replays the file changes between pre and post revisions from
+// the mirror back into Claude's tree. Mirror paths are keyed by fingerprint, so
+// each key is reverse-resolved via idx to the local project dir(s) it belongs to;
+// a key with no local project is skipped (it materializes on next reconcile once
+// that project is opened here).
+func propagateChanges(repo *gitwt.Repo, roots Roots, idx *project.Index, pre, post string) error {
 	out, err := repo.Run("diff", "--name-status", pre+".."+post)
 	if err != nil {
 		return err
 	}
+	applied := 0
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -297,31 +328,44 @@ func propagateChanges(repo *gitwt.Repo, roots Roots, pre, post string) error {
 		if strings.HasPrefix(status, "R") && len(fields) >= 3 {
 			oldPath := fields[1]
 			path = fields[2]
-			if hash, name, ok := splitMirrorPath(oldPath); ok {
-				_ = os.Remove(filepath.Join(roots.Claude, hash, "memory", name))
+			if key, name, ok := splitMirrorPath(oldPath); ok {
+				removeFromClaude(roots, idx, key, name)
 			}
 		} else {
 			path = fields[1]
 		}
-		hash, name, ok := splitMirrorPath(path)
+		key, name, ok := splitMirrorPath(path)
 		if !ok {
 			continue
 		}
 		switch {
 		case strings.HasPrefix(status, "D"):
-			_ = os.Remove(filepath.Join(roots.Claude, hash, "memory", name))
+			removeFromClaude(roots, idx, key, name)
+			applied++
 		default:
-			if err := CopyToClaude(roots, hash, name); err != nil {
+			if err := CopyToClaude(roots, idx, key, name); err != nil {
 				log.Printf("propagate %s: %v", path, err)
+			} else {
+				applied++
 			}
 		}
+	}
+	if applied > 0 {
+		log.Printf("applied %d inbound memory change(s) from remote", applied)
 	}
 	return nil
 }
 
-// splitMirrorPath converts a path of the form "projects/<hash>/memory/<file>"
+// removeFromClaude deletes a memory file from every local project mapping to key.
+func removeFromClaude(roots Roots, idx *project.Index, key, name string) {
+	for _, localHash := range idx.LocalsFor(key) {
+		_ = os.Remove(filepath.Join(roots.Claude, localHash, "memory", name))
+	}
+}
+
+// splitMirrorPath converts a path of the form "projects/<key>/memory/<file>"
 // (as it appears in `git diff --name-only`) into its parts.
-func splitMirrorPath(p string) (hash, name string, ok bool) {
+func splitMirrorPath(p string) (key, name string, ok bool) {
 	parts := strings.Split(filepath.ToSlash(p), "/")
 	if len(parts) != 4 || parts[0] != "projects" || parts[2] != "memory" {
 		return "", "", false
@@ -349,6 +393,24 @@ func refreshMemoryWatches(w *fsnotify.Watcher, claudeRoot string) error {
 		}
 	}
 	return nil
+}
+
+// rebuildIndex refreshes the localHash → fingerprint-key mapping from the
+// current Claude tree and persists it for observability. Best-effort: on error
+// it keeps any existing index (or an empty one) so the loop can proceed.
+func (l *Loop) rebuildIndex(roots Roots) {
+	idx, err := project.Build(roots.Claude)
+	if err != nil {
+		log.Println("build project index:", err)
+		if l.idx == nil {
+			l.idx = project.NewIndex()
+		}
+		return
+	}
+	l.idx = idx
+	if err := idx.Save(l.Cfg.SyncDir); err != nil {
+		log.Println("save project index:", err)
+	}
 }
 
 // refreshManifest rebuilds the manifest from the current Claude tree state

@@ -46,7 +46,8 @@ Full instructions:
 |---|---|
 | `cmd/claude-memsync` | Daemon binary: lifecycle + watcher + sync loop |
 | `cmd/claude-memmerge` | Git custom merge driver for `MEMORY.md` |
-| `internal/sync` | Mirror, reconcile, watcher loop, manifest |
+| `internal/sync` | Mirror, reconcile, watcher loop, manifest, layout migration |
+| `internal/project` | Project fingerprinting (path resolution, key derivation, per-PC index) |
 | `internal/merge` | Section-block parser + 3-way semantic merge |
 | `internal/distill` | Distilled-memory catalog index + reconcile |
 | `internal/gitwt` | Wrapper around the `git` CLI scoped to the sync work-tree |

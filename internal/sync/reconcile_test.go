@@ -47,7 +47,7 @@ func TestReconcile_DeleteOnThisPC_PropagatesToMirror(t *testing.T) {
 	manifest := NewManifest()
 	manifest.Add("proj1/memory/feedback_x.md")
 
-	rep, err := Reconcile(r, manifest)
+	rep, err := Reconcile(r, nil, manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestReconcile_NewFromAnotherPC_CopiesToClaude(t *testing.T) {
 	writeMem(t, r.Mirror, "proj1", "feedback_x.md", "from PC2")
 	manifest := NewManifest()
 
-	rep, err := Reconcile(r, manifest)
+	rep, err := Reconcile(r, nil, manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestReconcile_NilManifest_NeverDeletes(t *testing.T) {
 	// (first-run / missing manifest case).
 	writeMem(t, r.Mirror, "proj1", "feedback_x.md", "old content")
 
-	rep, err := Reconcile(r, nil)
+	rep, err := Reconcile(r, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestReconcile_NewLocalFile_CopiesToMirror(t *testing.T) {
 	writeMem(t, r.Claude, "proj1", "MEMORY.md", "# new on this PC\n")
 	manifest := NewManifest()
 
-	rep, err := Reconcile(r, manifest)
+	rep, err := Reconcile(r, nil, manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestReconcile_BothPresentSemanticMerge(t *testing.T) {
 	writeMem(t, r.Mirror, "proj1", "MEMORY.md", "# Project\n\n## Remote\nfrom mirror\n")
 	manifest := NewManifest()
 
-	rep, err := Reconcile(r, manifest)
+	rep, err := Reconcile(r, nil, manifest)
 	if err != nil {
 		t.Fatal(err)
 	}

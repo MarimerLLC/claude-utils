@@ -27,9 +27,12 @@ of its own — just a git remote you can push to.
   inherits your normal git credentials (Git Credential Manager on Windows, SSH
   agent or `~/.gitconfig` credential helpers on Linux/macOS). Confirm `git push`
   works against the remote before installing.
-- The same project paths on each PC. Claude's project-hash directory names are
-  derived from absolute paths, so if your repos live at the same drive letter /
-  mount point on every PC, you're set. (See [Limitations](#limitations--known-issues).)
+- Repos checked out at **different paths on different PCs still merge**: the
+  daemon fingerprints each project (by its git remote URL, falling back to the
+  root-commit SHA) and keys the sync repo by that fingerprint rather than the
+  local path. Non-git directories keep the old path-based key and only merge
+  across PCs that use identical paths. (See [How it works](#how-it-works) and
+  [Limitations](#limitations--known-issues).)
 
 ## Setup
 
@@ -133,21 +136,44 @@ and SSH keys. None require root.
 ## How it works
 
 ```
-~/.claude/projects/<hash>/memory/         (Claude reads + writes here — authoritative)
-                  │
+~/.claude/projects/<localHash>/memory/    (Claude reads + writes here — authoritative)
+                  │                        localHash = path with / → -, per machine
                   │  fsnotify watcher, 3s debounce
+                  │  fingerprint the project → stable key
                   ▼
-~/.claudesync/projects/<hash>/memory/     (mirror — git work-tree)
+~/.claudesync/projects/<key>/memory/       (mirror — git work-tree, keyed by fingerprint)
                   │
                   │  git add -A, commit, pull --rebase, push
                   ▼
-                <remote>                  (private GitHub repo)
+                <remote>                   (private GitHub repo)
                   │
                   │  ls-remote check on 1h timer (or after local push);
                   │  full pull only when remote SHA actually moved
                   ▼
-   propagate pull-driven changes back to ~/.claude/projects/...
+   propagate pull-driven changes back to ~/.claude/projects/<localHash>/...
 ```
+
+**Project fingerprinting.** Claude names each project directory by dash-encoding
+its absolute path (`/Users/me/code/foo` → `-Users-me-code-foo`), which differs
+per machine. Keying the sync repo by that name would split one repo into several.
+Instead the daemon resolves each project's real path (from the `cwd` Claude
+records in its session transcripts) and derives a machine-independent **key**:
+
+- `g-<hash>` — from the normalized `origin` remote URL (all of
+  `git@github.com:Acme/app.git`, `https://github.com/acme/app`, and
+  `…/app.git` collapse to the same key).
+- `r-<hash>` — from the git root-commit SHA, when the repo has no remote.
+- the dash-encoded path itself — fallback for non-git directories (unchanged
+  behavior; only merges across PCs with identical paths).
+
+A per-PC index at `~/.claudesync/.state/index.json` (gitignored) records the
+`localHash → key` mapping for observability and to route inbound changes back to
+the right local directory.
+
+**Lazy materialization.** A project synced from another PC but never opened on
+this one stays pending in the mirror — there's no local path to write it to yet.
+The first time you open that project here, its directory appears, fingerprints to
+the pending key, and the next reconcile copies its memories in.
 
 Idle ticks cost a single `git ls-remote` round-trip — no pull, no push, no merge
 driver invocation. The full pull/push cycle runs only when origin's branch SHA
@@ -176,6 +202,7 @@ commits.
   `~/.claude/history.jsonl`, `~/.claude/settings.json`, etc.
 - `~/.claudesync/config.json` — per-PC (paths embed your machine layout)
 - `~/.claudesync/.state/manifest.json` — per-PC (delete-detection state)
+- `~/.claudesync/.state/index.json` — per-PC (localHash → fingerprint key map)
 - `~/.claudesync/daemon.pid` — runtime state
 - `~/.claudesync/distilled/DISTILLED.md` — derived index, regenerated per-PC
   (the distilled `<slug>.md` entry files themselves **are** synced)
@@ -206,7 +233,7 @@ This means:
 ## On-disk layout
 
 ```
-~/.claude/projects/<hash>/memory/         # what Claude reads + writes
+~/.claude/projects/<localHash>/memory/    # what Claude reads + writes
     ├── MEMORY.md
     └── <topic>.md ...
 
@@ -217,10 +244,11 @@ This means:
     ├── .gitattributes                    # MEMORY.md merge=claude-memory-index
     ├── .gitignore                        # excludes config.json, .state/, etc.
     ├── .state/manifest.json              # per-PC delete-detection state
+    ├── .state/index.json                 # per-PC localHash → fingerprint key map
     ├── distilled/                        # shared distilled-memory catalog
     │   ├── DISTILLED.md                  # derived index (gitignored)
     │   └── <slug>.md ...                 # distilled entries (synced)
-    └── projects/<hash>/memory/...        # git work-tree mirror
+    └── projects/<key>/memory/...         # git work-tree mirror (keyed by fingerprint)
 ```
 
 ## Auth notes
@@ -246,10 +274,19 @@ If that works without prompting, the daemon will too.
 
 ## Limitations / known issues
 
-- **Path consistency required**: Claude derives the per-project memory directory
-  name by escaping the project's absolute path. PCs that open the same repo at
-  different paths (e.g. `C:\src\foo` vs. `D:\dev\foo`) will see them as different
-  projects.
+- **Git projects merge across paths; non-git ones don't**: git repos are keyed
+  by their remote URL (or root-commit SHA), so opening the same repo at different
+  paths on different PCs still merges. A non-git directory falls back to a
+  path-based key, so it only merges across PCs that use the identical absolute
+  path.
+- **Upgrading from a path-keyed layout**: the first daemon run after upgrading
+  migrates existing mirror directories to fingerprint keys, merging any that
+  collapse to the same key. Both PCs must be upgraded for a project's previously
+  divergent histories to converge on the shared key.
+- **Fingerprint edge cases**: a shallow clone (`git clone --depth 1`) has no true
+  root commit, so a remote-less shallow repo falls back to the path key. A repo
+  whose `origin` URL is later changed (renamed org, new host) re-keys and will
+  re-merge under the new key.
 - **No live conflict UI**: when the merge driver emits actual conflict markers
   (rare; only on overlapping line edits within the same `MEMORY.md` section
   body), the file is committed and pushed with markers. The next time you edit on
