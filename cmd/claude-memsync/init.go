@@ -179,7 +179,10 @@ func bootstrap(cfg config.Config, force bool) error {
 
 // printDistillPermissionHint suggests the one-time Claude Code permission rule
 // that lets the /distill and /distill-apply skills read and write the shared
-// catalog without prompting under default (non-bypass) permissions. We only
+// catalog without prompting under default (non-bypass) permissions. The write
+// side must be spelled Edit(path), not Write(path): Claude Code matches file
+// permission checks against Edit rules only (they cover every file-editing
+// tool), and warns at startup about any Write(path) allow rule. We only
 // advise — editing the user's global settings.json is left to them (or the
 // update-config skill), since it is theirs to own.
 func printDistillPermissionHint(cfg config.Config) {
@@ -188,7 +191,7 @@ func printDistillPermissionHint(cfg config.Config) {
 	fmt.Fprintln(os.Stderr, "To let the /distill skills use the catalog without permission prompts,")
 	fmt.Fprintln(os.Stderr, "add this to ~/.claude/settings.json (permissions.allow):")
 	fmt.Fprintf(os.Stderr, "  \"Read(%s/**)\",\n", dir)
-	fmt.Fprintf(os.Stderr, "  \"Write(%s/**)\"\n", dir)
+	fmt.Fprintf(os.Stderr, "  \"Edit(%s/**)\"\n", dir)
 }
 
 // tryClone attempts `git clone <url> <dir>`. Returns (true, nil) on success,
