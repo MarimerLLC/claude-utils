@@ -11,6 +11,7 @@ import (
 
 	"github.com/MarimerLLC/claude-utils/internal/config"
 	"github.com/MarimerLLC/claude-utils/internal/gitwt"
+	"github.com/MarimerLLC/claude-utils/internal/project"
 	syncpkg "github.com/MarimerLLC/claude-utils/internal/sync"
 )
 
@@ -130,14 +131,31 @@ func bootstrap(cfg config.Config, force bool) error {
 		return err
 	}
 	roots := syncpkg.Roots{Claude: cfg.ClaudeProjectsDir, Mirror: mirrorProjects}
+
+	// Build the fingerprint index and migrate any legacy path-keyed dirs the
+	// remote already carries (from a pre-fingerprint version or another machine)
+	// to their fingerprint keys before reconciling local memories in.
+	idx, err := project.Build(cfg.ClaudeProjectsDir)
+	if err != nil {
+		return fmt.Errorf("build project index: %w", err)
+	}
+	if migRep, err := syncpkg.MigrateLayout(roots, idx); err != nil {
+		return fmt.Errorf("migrate layout: %w", err)
+	} else {
+		printReport(migRep)
+	}
+
 	// First-time init: no manifest yet. Pass nil so Reconcile doesn't try
 	// to propagate deletes (with no prior state, "missing in Claude" can't
 	// be distinguished from "this PC never had it").
-	report, err := syncpkg.Reconcile(roots, nil)
+	report, err := syncpkg.Reconcile(roots, idx, nil)
 	if err != nil {
 		return fmt.Errorf("reconcile: %w", err)
 	}
 	printReport(report)
+	if err := idx.Save(cfg.SyncDir); err != nil {
+		fmt.Fprintln(os.Stderr, "save project index:", err)
+	}
 
 	// Step 6: stage + commit + push.
 	if err := repo.AddAll(); err != nil {

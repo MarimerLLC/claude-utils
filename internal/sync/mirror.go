@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MarimerLLC/claude-utils/internal/merge"
+	"github.com/MarimerLLC/claude-utils/internal/project"
 )
 
 // Roots names a pair of (Claude authoritative, mirror) parents.
@@ -26,36 +27,13 @@ import (
 //	Claude: C:\Users\rocky\.claude\projects
 //	Mirror: C:\Users\rocky\.claudesync\projects
 //
-// Each child directory under either root represents one project (named by
-// Claude's hash of the absolute project path).
+// Claude child dirs are named by Claude's dash-encoding of the absolute project
+// path (localHash); mirror child dirs are named by the project's machine-
+// independent fingerprint key, so the same repo lines up across machines that
+// check it out at different paths. The project.Index maps between the two.
 type Roots struct {
 	Claude string // ~/.claude/projects
 	Mirror string // ~/.claudesync/projects
-}
-
-// MemoryDirs lists every <hash>/memory directory found under either root.
-func (r Roots) MemoryDirs() ([]string, error) {
-	seen := map[string]struct{}{}
-	for _, root := range []string{r.Claude, r.Mirror} {
-		entries, err := os.ReadDir(root)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", root, err)
-		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			seen[e.Name()] = struct{}{}
-		}
-	}
-	dirs := make([]string, 0, len(seen))
-	for hash := range seen {
-		dirs = append(dirs, hash)
-	}
-	return dirs, nil
 }
 
 // SyncReport is returned by reconciliation operations for diagnostics.
@@ -71,7 +49,14 @@ type SyncReport struct {
 // manifest to distinguish "user deleted this" from "this is new from
 // another PC." Pass a nil or empty manifest to disable delete detection
 // (the safe behavior for first-ever sync, since with no prior state we
-// can't know what to delete).
+// can't know what to delete). Pass a nil index to build one from the Claude
+// tree.
+//
+// The Claude side stays keyed by localHash (Claude's dash-encoded dir name);
+// the mirror side is keyed by the project's machine-independent fingerprint,
+// resolved through idx. Only projects present locally are reconciled — a mirror
+// key with no local project (opened only on another PC) is left pending and
+// materializes when that project is first opened here.
 //
 // Decisions for each file path:
 //
@@ -88,20 +73,46 @@ type SyncReport struct {
 // This function is used during `init` and as a periodic safety net on the
 // pull tick. The watcher-driven sync loop also handles incremental events
 // directly via CopyToMirror / RemoveFromMirror.
-func Reconcile(r Roots, manifest *Manifest) (SyncReport, error) {
+func Reconcile(r Roots, idx *project.Index, manifest *Manifest) (SyncReport, error) {
 	rep := SyncReport{}
 	if manifest == nil {
 		manifest = NewManifest()
 	}
-
-	hashes, err := r.MemoryDirs()
-	if err != nil {
-		return rep, err
+	if idx == nil {
+		var err error
+		idx, err = project.Build(r.Claude)
+		if err != nil {
+			return rep, err
+		}
 	}
 
-	for _, hash := range hashes {
-		claudeMem := filepath.Join(r.Claude, hash, "memory")
-		mirrorMem := filepath.Join(r.Mirror, hash, "memory")
+	// Reconcile every local project against its key, plus any mirror-only dir
+	// whose key is a legacy path key (== a localHash) so inbound files for
+	// identical-path / non-git projects still materialize into Claude. A
+	// fingerprint-keyed mirror dir with no local project can't be reversed to a
+	// path, so it waits (materializes when the project is first opened here).
+	type pair struct{ localHash, key string }
+	var pairs []pair
+	seenKey := map[string]bool{}
+	for localHash, entry := range idx.All() {
+		pairs = append(pairs, pair{localHash, entry.Key})
+		seenKey[entry.Key] = true
+	}
+	if mirrorEntries, err := os.ReadDir(r.Mirror); err == nil {
+		for _, e := range mirrorEntries {
+			if !e.IsDir() || seenKey[e.Name()] || project.IsFingerprintKey(e.Name()) {
+				continue
+			}
+			pairs = append(pairs, pair{e.Name(), e.Name()})
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return rep, fmt.Errorf("read mirror %s: %w", r.Mirror, err)
+	}
+
+	for _, p := range pairs {
+		localHash := p.localHash
+		claudeMem := filepath.Join(r.Claude, localHash, "memory")
+		mirrorMem := filepath.Join(r.Mirror, p.key, "memory")
 		if err := os.MkdirAll(mirrorMem, 0700); err != nil {
 			return rep, err
 		}
@@ -134,7 +145,9 @@ func Reconcile(r Roots, manifest *Manifest) (SyncReport, error) {
 		for name := range files {
 			cp := filepath.Join(claudeMem, name)
 			mp := filepath.Join(mirrorMem, name)
-			rel := filepath.ToSlash(filepath.Join(hash, "memory", name))
+			// Manifest keys are Claude-side (localHash), independent of the mirror
+			// key, so fingerprinting doesn't disturb delete detection.
+			rel := filepath.ToSlash(filepath.Join(localHash, "memory", name))
 
 			cExists, cBytes := readIfExists(cp)
 			mExists, mBytes := readIfExists(mp)
@@ -195,11 +208,13 @@ func Reconcile(r Roots, manifest *Manifest) (SyncReport, error) {
 	return rep, nil
 }
 
-// CopyToMirror copies a single Claude-side file into the mirror, creating
-// parent dirs as needed. Used by the watcher loop on a file change.
-func CopyToMirror(r Roots, hash, name string) error {
-	src := filepath.Join(r.Claude, hash, "memory", name)
-	dst := filepath.Join(r.Mirror, hash, "memory", name)
+// CopyToMirror copies a single Claude-side file into the mirror under the
+// project's fingerprint key, creating parent dirs as needed. Used by the watcher
+// loop on a file change.
+func CopyToMirror(r Roots, idx *project.Index, localHash, name string) error {
+	key := idx.KeyFor(r.Claude, localHash)
+	src := filepath.Join(r.Claude, localHash, "memory", name)
+	dst := filepath.Join(r.Mirror, key, "memory", name)
 	b, err := os.ReadFile(src)
 	if err != nil {
 		return err
@@ -210,30 +225,111 @@ func CopyToMirror(r Roots, hash, name string) error {
 	return writeAtomic(dst, b)
 }
 
-// CopyToClaude copies a single mirror-side file back into Claude's tree.
-// Used after a `git pull` brings in remote changes.
-func CopyToClaude(r Roots, hash, name string) error {
-	src := filepath.Join(r.Mirror, hash, "memory", name)
-	dst := filepath.Join(r.Claude, hash, "memory", name)
+// CopyToClaude copies a single mirror-side file (addressed by fingerprint key)
+// back into every local project that maps to that key. A key with no local
+// project is skipped — it materializes later when the project is first opened
+// here. Used after a `git pull` brings in remote changes.
+func CopyToClaude(r Roots, idx *project.Index, key, name string) error {
+	src := filepath.Join(r.Mirror, key, "memory", name)
 	b, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
-		return err
+	for _, localHash := range idx.LocalsFor(key) {
+		dst := filepath.Join(r.Claude, localHash, "memory", name)
+		if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
+			return err
+		}
+		if err := writeAtomic(dst, b); err != nil {
+			return err
+		}
 	}
-	return writeAtomic(dst, b)
+	return nil
 }
 
-// RemoveFromMirror handles a Claude-side delete: remove the corresponding
-// mirror file so the next commit propagates the deletion.
-func RemoveFromMirror(r Roots, hash, name string) error {
-	target := filepath.Join(r.Mirror, hash, "memory", name)
+// RemoveFromMirror handles a Claude-side delete: remove the corresponding mirror
+// file (under the project's fingerprint key) so the next commit propagates the
+// deletion.
+func RemoveFromMirror(r Roots, idx *project.Index, localHash, name string) error {
+	key := idx.KeyFor(r.Claude, localHash)
+	target := filepath.Join(r.Mirror, key, "memory", name)
 	err := os.Remove(target)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	return err
+}
+
+// MigrateLayout moves legacy path-keyed mirror directories to their fingerprint
+// keys, so a project previously split by path (a separate dir per machine)
+// collapses to one key. When the target key dir already exists — because another
+// machine already migrated and pushed it, or a prior run did — the two are
+// unioned: MEMORY.md via the semantic merge driver, other files copied when
+// absent, and genuine conflicts preserved as <name>.from-remote-<random>.
+//
+// Idempotent: once a project's mirror dir is its fingerprint key there is no
+// legacy dir left to move. Projects that can't be fingerprinted keep their path
+// key and are left untouched.
+func MigrateLayout(r Roots, idx *project.Index) (SyncReport, error) {
+	rep := SyncReport{}
+	for localHash, entry := range idx.All() {
+		if entry.Key == localHash {
+			continue // path fallback — already at its final key
+		}
+		oldProj := filepath.Join(r.Mirror, localHash)
+		oldMem := filepath.Join(oldProj, "memory")
+		if _, err := os.Stat(oldMem); err != nil {
+			continue // nothing legacy to migrate for this project
+		}
+		newMem := filepath.Join(r.Mirror, entry.Key, "memory")
+		if err := os.MkdirAll(newMem, 0700); err != nil {
+			return rep, err
+		}
+
+		entries, err := os.ReadDir(oldMem)
+		if err != nil {
+			return rep, err
+		}
+		for _, e := range entries {
+			if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			name := e.Name()
+			rel := filepath.ToSlash(filepath.Join(entry.Key, "memory", name))
+			oldBytes, err := os.ReadFile(filepath.Join(oldMem, name))
+			if err != nil {
+				return rep, err
+			}
+			newPath := filepath.Join(newMem, name)
+			newExists, newBytes := readIfExists(newPath)
+			switch {
+			case !newExists:
+				if err := writeAtomic(newPath, oldBytes); err != nil {
+					return rep, err
+				}
+				rep.CopiedToMirror = append(rep.CopiedToMirror, rel)
+			case bytes.Equal(oldBytes, newBytes):
+				// identical — nothing to do
+			case name == "MEMORY.md":
+				merged, _ := merge.Merge("", string(newBytes), string(oldBytes))
+				if err := writeAtomic(newPath, []byte(merged)); err != nil {
+					return rep, err
+				}
+				rep.Merged = append(rep.Merged, rel)
+			default:
+				backup := fmt.Sprintf("%s.from-remote-%s", newPath, randSuffix())
+				if err := writeAtomic(backup, oldBytes); err != nil {
+					return rep, err
+				}
+				rep.BackedUp = append(rep.BackedUp, rel)
+			}
+		}
+
+		if err := os.RemoveAll(oldProj); err != nil {
+			return rep, err
+		}
+	}
+	return rep, nil
 }
 
 func readIfExists(p string) (bool, []byte) {
