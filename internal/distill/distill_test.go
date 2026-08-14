@@ -203,6 +203,45 @@ func TestReconcilePrunesStaleEntries(t *testing.T) {
 	}
 }
 
+// The catalog is shared across workstations, so an entry distilled on PC1 from
+// a repo that PC2 has never opened has a legitimately absent source on PC2.
+// Pruning it there would push the deletion back through git and destroy the
+// entry everywhere. Reconcile must prune only what it can actually judge.
+func TestReconcileSkipsEntriesFromProjectsNotOnThisMachine(t *testing.T) {
+	dir := t.TempDir()
+	projects := filepath.Join(dir, "projects")
+	distilled := filepath.Join(dir, "distilled")
+
+	// Source under a project we have, still marked -> kept.
+	writeFile(t, filepath.Join(projects, "P1", "memory", "live.md"), sourceMemory("live", true, "x"))
+	writeFile(t, filepath.Join(distilled, "live.md"), catalogEntry("live", "d", "feedback", "P1", "live.md", "x"))
+	// Source under a project we have, marker removed -> genuinely stale, prune.
+	writeFile(t, filepath.Join(projects, "P1", "memory", "untagged.md"), sourceMemory("untagged", false, "y"))
+	writeFile(t, filepath.Join(distilled, "untagged.md"), catalogEntry("untagged", "d", "feedback", "P1", "untagged.md", "y"))
+	// Source under a project this machine has never opened -> unjudgeable, skip.
+	writeFile(t, filepath.Join(distilled, "from-pc2.md"), catalogEntry("from-pc2", "d", "feedback", "P2", "remote.md", "z"))
+
+	res, err := Reconcile(Options{DistilledDir: distilled, ProjectsDir: projects})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Pruned != 1 {
+		t.Errorf("Pruned = %d, want 1 (only the locally-untagged source)", res.Pruned)
+	}
+	if res.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1 (the entry from another workstation)", res.Skipped)
+	}
+	if _, err := os.Stat(filepath.Join(distilled, "from-pc2.md")); err != nil {
+		t.Errorf("entry whose origin project is absent here must survive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(distilled, "live.md")); err != nil {
+		t.Errorf("live.md should have survived: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(distilled, "untagged.md")); !os.IsNotExist(err) {
+		t.Errorf("untagged.md should have been pruned")
+	}
+}
+
 func TestReconcileNeverPrunesBlindWhenSourcesInvisible(t *testing.T) {
 	dir := t.TempDir()
 	distilled := filepath.Join(dir, "distilled")
