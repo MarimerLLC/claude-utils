@@ -39,6 +39,79 @@ func TestParse_PreambleAndSections(t *testing.T) {
 	}
 }
 
+func TestParse_DuplicateHeadingsGetDistinctKeys(t *testing.T) {
+	in := "# T\n\n## Notes\nfirst\n\n## Notes\nsecond\n"
+	got := Parse(in)
+	if len(got) != 3 {
+		t.Fatalf("want 3 blocks (preamble + 2 sections), got %d: %#v", len(got), got)
+	}
+	if got[1].Key == got[2].Key {
+		t.Fatalf("repeated headings must get distinct keys; both are %q", got[1].Key)
+	}
+	if got[1].Key != "notes" {
+		t.Errorf("first occurrence should keep the plain key, got %q", got[1].Key)
+	}
+	if !strings.Contains(got[1].Body, "first") || !strings.Contains(got[2].Body, "second") {
+		t.Errorf("bodies mismatched: %q / %q", got[1].Body, got[2].Body)
+	}
+}
+
+// A MEMORY.md that repeats an H2 must survive a merge intact. Before the
+// occurrence-numbering fix, blocksByKey collapsed both sections into one map
+// entry and the first one's body was dropped — even here, where all three
+// inputs are byte-identical and the merge should be a no-op.
+func TestMerge_DuplicateHeadingsPreserved(t *testing.T) {
+	doc := "# T\n\n## Notes\nfirst\n\n## Notes\nsecond\n"
+
+	got, conflict := Merge(doc, doc, doc)
+	if conflict {
+		t.Fatalf("identical inputs must not conflict; got=%q", got)
+	}
+	if n := strings.Count(got, "## Notes"); n != 2 {
+		t.Errorf("expected both Notes headings preserved, got %d in %q", n, got)
+	}
+	for _, want := range []string{"first", "second"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lost body %q: %q", want, got)
+		}
+	}
+}
+
+// Keys are lowercased so "## Deploy" on one PC matches "## deploy" on another.
+// That must not make two case-variant headings in the *same* file collapse.
+func TestMerge_CaseVariantHeadingsBothKept(t *testing.T) {
+	doc := "# T\n\n## Notes\nupper\n\n## notes\nlower\n"
+
+	got, conflict := Merge(doc, doc, doc)
+	if conflict {
+		t.Fatalf("identical inputs must not conflict; got=%q", got)
+	}
+	for _, want := range []string{"upper", "lower"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lost body %q: %q", want, got)
+		}
+	}
+}
+
+// Each occurrence is merged against its own counterpart, so edits to different
+// repeats of the same heading combine cleanly instead of fighting.
+func TestMerge_DuplicateHeadingsMatchByOccurrence(t *testing.T) {
+	base := "## Notes\nfirst\n\n## Notes\nsecond\n"
+	ours := "## Notes\nfirst edited by us\n\n## Notes\nsecond\n"
+	theirs := "## Notes\nfirst\n\n## Notes\nsecond edited by them\n"
+
+	got, conflict := Merge(base, ours, theirs)
+	if conflict {
+		t.Fatalf("edits to different occurrences should merge cleanly; got=%q", got)
+	}
+	if !strings.Contains(got, "first edited by us") {
+		t.Errorf("lost our edit to the first occurrence: %q", got)
+	}
+	if !strings.Contains(got, "second edited by them") {
+		t.Errorf("lost their edit to the second occurrence: %q", got)
+	}
+}
+
 func TestMerge_BothAddDisjointSections(t *testing.T) {
 	base := "# Project\n"
 	ours := "# Project\n\n## Deploy\nuse helm.\n"
