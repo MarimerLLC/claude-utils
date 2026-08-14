@@ -95,6 +95,7 @@ type Conflict struct {
 type Result struct {
 	Indexed   int        // catalog entries written to the index
 	Pruned    int        // stale catalog entries removed (Reconcile)
+	Skipped   int        // entries left alone because their origin project isn't on this machine
 	Pending   []Origin   // marked source memories with no catalog entry yet
 	Conflicts []Conflict // same name, divergent content across sources
 }
@@ -103,19 +104,19 @@ type Result struct {
 // entry point used by `claude-memsync distill`.
 func Run(opts Options, prune bool) (Result, error) {
 	opts.applyDefaults()
-	var pruned int
+	var pruned, skipped int
 	if prune {
 		r, err := Reconcile(opts)
 		if err != nil {
 			return Result{}, err
 		}
-		pruned = r.Pruned
+		pruned, skipped = r.Pruned, r.Skipped
 	}
 	res, err := BuildIndex(opts)
 	if err != nil {
 		return res, err
 	}
-	res.Pruned = pruned
+	res.Pruned, res.Skipped = pruned, skipped
 	return res, nil
 }
 
@@ -161,9 +162,22 @@ func analyze(opts Options, entries []Entry) Result {
 }
 
 // Reconcile removes catalog entries whose originating memory no longer carries
-// the marker or no longer exists. It is conservative: if the projects tree is
-// not visible at all, it prunes nothing (avoids wiping the catalog on a machine
-// that only consumes it).
+// the marker or no longer exists. It is conservative in two ways, because the
+// catalog is shared: a wrong prune deletes the entry file, and the daemon's
+// `git add -A` then propagates that deletion to every other workstation.
+//
+//   - If the projects tree is not visible at all, it prunes nothing (a machine
+//     that only consumes the catalog must not wipe it).
+//   - If an entry's *origin project* is not present on this machine, it is
+//     skipped rather than pruned. ~/.claude/projects exists on every machine
+//     running Claude Code, so the tree-level check above says nothing about any
+//     individual project: an entry distilled on another workstation, from a repo
+//     never opened here, has a legitimately absent source. Reading that as "the
+//     user deleted it" would destroy the entry globally.
+//
+// The cost of this is that an entry whose project directory the user really did
+// delete stays in the catalog until removed by hand. That asymmetry is
+// deliberate — a missed prune is an annoyance, a wrong prune is data loss.
 func Reconcile(opts Options) (Result, error) {
 	opts.applyDefaults()
 	var res Result
@@ -180,7 +194,13 @@ func Reconcile(opts Options) (Result, error) {
 		if e.OriginProject == "" || e.OriginFile == "" {
 			continue // hand-authored entry with no source; leave it alone
 		}
-		src := filepath.Join(opts.ProjectsDir, e.OriginProject, "memory", e.OriginFile)
+		memDir := filepath.Join(opts.ProjectsDir, e.OriginProject, "memory")
+		if _, err := os.Stat(memDir); err != nil {
+			// Origin project absent on this workstation — unjudgeable, not stale.
+			res.Skipped++
+			continue
+		}
+		src := filepath.Join(memDir, e.OriginFile)
 		content, err := os.ReadFile(src)
 		stale := false
 		switch {

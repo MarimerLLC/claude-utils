@@ -72,6 +72,10 @@ func report(res distill.Result, dryRun bool) {
 	if res.Pruned > 0 {
 		fmt.Printf("pruned %d stale %s\n", res.Pruned, plural(res.Pruned, "entry", "entries"))
 	}
+	if res.Skipped > 0 {
+		fmt.Printf("kept %d %s whose origin project isn't on this machine (can't judge from here)\n",
+			res.Skipped, plural(res.Skipped, "entry", "entries"))
+	}
 	if len(res.Pending) > 0 {
 		fmt.Printf("\n%d marked %s awaiting distillation (run /distill to generalize):\n",
 			len(res.Pending), plural(len(res.Pending), "memory", "memories"))

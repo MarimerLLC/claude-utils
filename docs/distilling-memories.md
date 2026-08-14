@@ -146,6 +146,14 @@ claude-memsync distill --dry-run  # show what would change, write nothing
 claude-memsync distill --prune    # also remove entries whose source is gone
 ```
 
+`--prune` only judges entries whose **origin project exists on the machine you
+run it from**. The catalog is shared, so an entry distilled on one workstation
+from a repo you have never opened here has a legitimately absent source —
+pruning it would push that deletion to all your machines. Those entries are
+reported as `kept … (can't judge from here)` and left alone. To retire one,
+either run `--prune` on the machine that owns the source project, or delete the
+`<slug>.md` by hand.
+
 The CLI prints:
 
 - how many entries are in the catalog,
@@ -191,7 +199,8 @@ to know what belongs.
   them into one generalized entry.
 - **A distilled lesson no longer applies.** Delete its `<slug>.md` from the
   catalog (or remove the `scope: environment` tag from the source and run
-  `claude-memsync distill --prune`).
+  `claude-memsync distill --prune` **on the machine holding that source
+  project** — prune skips entries it cannot verify from where it is run).
 - **`DISTILLED.md` looks stale.** It's a derived file, regenerated locally; run
   `claude-memsync distill` to rebuild it. It is intentionally not synced (each PC
   regenerates its own to avoid merge conflicts on the generated table).
