@@ -36,9 +36,24 @@ type Block struct {
 	Body    string // raw body content from after heading line up to next heading
 }
 
+// dupKeySep separates a heading key from its occurrence number when one
+// document repeats the same H2 (or two headings that differ only in case,
+// since keys are lowercased). Without this, blocksByKey would collapse them
+// into a single map entry and every section but the last would be dropped —
+// silent data loss, even on a merge where nothing actually changed.
+//
+// The separator is a NUL byte because it cannot occur in real markdown, so a
+// disambiguated key can never collide with a genuine heading's key. Keys are
+// internal to the merge algorithm and never appear in the output; only
+// Block.Heading is written.
+const dupKeySep = "\x00#"
+
 var headingRe = regexp.MustCompile(`(?m)^##[ \t]+.*$`)
 
-// Parse splits MEMORY.md content into blocks keyed by H2 heading.
+// Parse splits MEMORY.md content into blocks keyed by H2 heading. Repeated
+// headings within one document are disambiguated by occurrence, so the Nth
+// "## Notes" in ours matches the Nth "## Notes" in theirs. Cross-document
+// matching stays case-insensitive; only same-document repeats are separated.
 func Parse(content string) []Block {
 	indices := headingRe.FindAllStringIndex(content, -1)
 	if len(indices) == 0 {
@@ -48,6 +63,7 @@ func Parse(content string) []Block {
 	if indices[0][0] > 0 {
 		blocks = append(blocks, Block{Heading: "", Key: PreambleKey, Body: content[:indices[0][0]]})
 	}
+	occurrences := map[string]int{}
 	for i, idx := range indices {
 		start := idx[0]
 		end := len(content)
@@ -64,6 +80,12 @@ func Parse(content string) []Block {
 			body = content[start+hdrEnd+1 : end]
 		}
 		key := normalizeKey(strings.TrimSpace(strings.TrimLeft(strings.TrimRight(heading, "\r\n"), "#")))
+		occurrences[key]++
+		// First occurrence keeps the plain key so cross-document matching is
+		// unaffected; repeats get an occurrence-numbered variant.
+		if n := occurrences[key]; n > 1 {
+			key = fmt.Sprintf("%s%s%d", key, dupKeySep, n)
+		}
 		blocks = append(blocks, Block{Heading: heading, Key: key, Body: body})
 	}
 	return blocks
