@@ -17,6 +17,12 @@ Two capabilities, both built from a single pair of Go binaries
   preferences) out of one project and reuse them in any other, existing or new,
   via a shared catalog and two Claude skills (`/distill`, `/distill-apply`).
 
+Plus a small Windows-only helper:
+
+- **[claude-focus](docs/claude-focus.md)** — brings the Claude desktop app to
+  the front (launching it if needed). Bind it to the Copilot key with PowerToys
+  so that key opens Claude instead of Copilot.
+
 ## Quick start
 
 ```sh
@@ -46,6 +52,7 @@ Full instructions:
 |---|---|
 | `cmd/claude-memsync` | Daemon binary: lifecycle + watcher + sync loop |
 | `cmd/claude-memmerge` | Git custom merge driver for `MEMORY.md` |
+| `cmd/claude-focus` | Windows-only: focus or launch the Claude desktop app from a hotkey |
 | `internal/sync` | Mirror, reconcile, watcher loop, manifest |
 | `internal/merge` | Section-block parser + 3-way semantic merge |
 | `internal/distill` | Distilled-memory catalog index + reconcile |
@@ -104,7 +111,7 @@ After 1.0 the standard SemVer rules kick in (breaking → major, additive → mi
 
 3. Publishing the Release fires `.github/workflows/release.yml`, which
    cross-compiles both binaries for {linux, darwin, windows} ×
-   {amd64, arm64}, stamps the version in via `-ldflags`, packages each
+   {amd64, arm64} (plus `claude-focus.exe` for Windows), stamps the version in via `-ldflags`, packages each
    target as `claude-utils-v0.1.8-<os>-<arch>.{tar.gz,zip}`, generates
    `SHA256SUMS`, and uploads everything to the Release. ~1 minute.
 

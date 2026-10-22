@@ -51,6 +51,11 @@ jobs:
               -o "${outdir}/claude-memsync${ext}" ./cmd/claude-memsync
             GOOS="${GOOS}" GOARCH="${GOARCH}" go build -trimpath -ldflags "${LDFLAGS}" \
               -o "${outdir}/claude-memmerge${ext}" ./cmd/claude-memmerge
+            if [ "${GOOS}" = "windows" ]; then
+              # GUI subsystem so launching it from a hotkey never flashes a console.
+              GOOS="${GOOS}" GOARCH="${GOARCH}" go build -trimpath -ldflags "${LDFLAGS} -H windowsgui" \
+                -o "${outdir}/claude-focus${ext}" ./cmd/claude-focus
+            fi
             echo "::endgroup::"
 
             cp LICENSE README.md "${outdir}/"
