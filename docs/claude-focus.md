@@ -37,9 +37,8 @@ may only offer Copilot, so use [PowerToys](https://learn.microsoft.com/windows/p
 Keyboard Manager instead:
 
 1. Open **PowerToys → Keyboard Manager → Remap a shortcut** and add a remap.
-2. For the shortcut, press the Copilot key. Keyboards differ in what it sends —
-   commonly **Win + Shift + F23**, or on some keyboards **Left Shift + Menu** —
-   so let the editor capture it rather than typing it in.
+2. For the shortcut, press the Copilot key. It sends **Win + Shift + F23**;
+   let the editor capture it rather than typing it in.
 3. Set the action to **Run program**:
    - **Program:** the **full path** to `claude-focus.exe`. Keyboard Manager
      resolves bare names against its own install folder, not `PATH`, so
@@ -47,10 +46,29 @@ Keyboard Manager instead:
    - **Arguments:** none.
    - **If running:** leave as **Show window** (it exits immediately, so it is
      never found running) — or **Start another**; either works.
-   - **Visibility:** **Hidden** if you built a console binary; doesn't matter
-     for the `-H windowsgui` build.
+   - **Visibility:** **Normal** for the `-H windowsgui` build (it has no
+     window to show). **Hidden** only if you built a console binary — on the
+     GUI build it just makes PowerToys retry looking for a window to hide.
 
 PowerToys must be running for the remap to work.
+
+### Keyboards where Fn switches the key to Menu
+
+On some keyboards (Surface keyboards, for example) the Copilot key sits where
+the Menu key used to be, and **Fn** switches it between Copilot
+(Win + Shift + F23) and Menu. With Fn lock on, pressing the key alone sends
+**Menu**, and the remap above never sees it.
+
+To have both modes open Claude, add a key remap that turns Menu into Copilot:
+
+1. **Keyboard Manager → Remap a key**: **Menu** → **Win + Shift + F23**, with
+   the condition set to when the key is pressed **alone**.
+2. Keep the **Win + Shift + F23 → Run program** shortcut from above.
+
+A single-key remap can feed a shortcut remap, so this works. The reverse does
+not: Keyboard Manager ignores keys it sends itself, so one *shortcut* remap
+never triggers another. Remapping Win + Shift + F23 to some other shortcut
+that runs the program just swallows the Copilot key and does nothing.
 
 ## Troubleshooting
 
@@ -59,6 +77,9 @@ Keyboard Manager logs every remap it fires to
 Look for `ChordKeyboardHandler` lines:
 
 - No new lines when you press the key → the shortcut didn't match; recapture it.
+  If the key is in Menu mode, see the Fn section above.
+- `keyEventList.size` lines but no `trying to run` → the key was remapped to
+  another shortcut, which doesn't chain; point it at **Run program** instead.
 - `Error starting … The program was not found` → use a full path.
 - `already running … TryShowExistingProgram` → *If running* is set to
   **Show window** and a process with the same file name was already running,
