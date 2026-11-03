@@ -252,7 +252,15 @@ func (l *Loop) flush(repo *gitwt.Repo, roots Roots, includeLocal bool) error {
 }
 
 // remoteAndLocalIdle reports whether there is nothing to do: origin's branch
-// SHA matches our cached remote-tracking ref AND we have no unpushed commits.
+// SHA, our cached remote-tracking ref, and HEAD all point at the same commit.
+//
+// Comparing HEAD to the tracking ref (rather than only counting unpushed
+// commits) also catches the case where the tracking ref was advanced by a
+// fetch that HEAD never caught up with — a manual `git fetch` in the sync
+// dir, or a pull whose fetch succeeded but whose rebase failed. Without that
+// check the gate sees "remote unchanged, nothing unpushed" and the PC stays
+// behind until some other PC pushes again.
+//
 // Returns (false, nil) when the gate cannot prove idleness — including the
 // first run before refs/remotes/origin/<branch> exists locally.
 func remoteAndLocalIdle(repo *gitwt.Repo, branch string) (bool, error) {
@@ -267,11 +275,13 @@ func remoteAndLocalIdle(repo *gitwt.Repo, branch string) (bool, error) {
 	if strings.TrimSpace(cachedSHA) != remoteSHA {
 		return false, nil // remote moved
 	}
-	unpushed, err := repo.Run("rev-list", "--count", "refs/remotes/origin/"+branch+"..HEAD")
+	headSHA, err := repo.Run("rev-parse", "--verify", "--quiet", "HEAD")
 	if err != nil {
 		return false, nil
 	}
-	return strings.TrimSpace(unpushed) == "0", nil
+	// HEAD ahead (unpushed), behind (fetched but not merged), or diverged
+	// all mean there's work for pull/push to do.
+	return strings.TrimSpace(headSHA) == remoteSHA, nil
 }
 
 // propagateChanges replays the file changes between pre and post revisions
