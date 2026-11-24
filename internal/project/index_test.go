@@ -101,26 +101,9 @@ func TestLoad_MissingReturnsEmpty(t *testing.T) {
 	}
 }
 
-func TestKeyFor_CachesOnMiss(t *testing.T) {
-	projects := t.TempDir()
-	plain := filepath.Join(projects, "-plain")
-	if err := os.MkdirAll(plain, 0700); err != nil {
-		t.Fatal(err)
-	}
-	idx := NewIndex()
-	key, ok := idx.KeyFor(projects, "-plain")
-	if !ok || key != "-plain" {
-		t.Fatalf("KeyFor = %q, %v; want path fallback -plain", key, ok)
-	}
-	if _, ok := idx.Get("-plain"); !ok {
-		t.Errorf("KeyFor should cache the computed entry")
-	}
-}
-
 // A project whose transcript was just created but doesn't carry a cwd yet must
-// not be pinned to the path key: KeyFor reports pending and caches nothing, and
-// Build leaves it out.
-func TestKeyFor_PendingWhenTranscriptLacksCwd(t *testing.T) {
+// not be pinned to the path key: Build leaves it out until it can be keyed.
+func TestBuild_PendingWhenTranscriptLacksCwd(t *testing.T) {
 	projects := t.TempDir()
 	dir := filepath.Join(projects, "-new-proj")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -128,13 +111,6 @@ func TestKeyFor_PendingWhenTranscriptLacksCwd(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(dir, "s.jsonl"), []byte(`{"type":"mode"}`+"\n"), 0600); err != nil {
 		t.Fatal(err)
-	}
-	idx := NewIndex()
-	if key, ok := idx.KeyFor(projects, "-new-proj"); ok {
-		t.Fatalf("KeyFor = %q, true; want pending", key)
-	}
-	if _, cached := idx.Get("-new-proj"); cached {
-		t.Errorf("pending project must not be cached")
 	}
 	built, err := Build(projects, nil)
 	if err != nil {
@@ -149,8 +125,12 @@ func TestKeyFor_PendingWhenTranscriptLacksCwd(t *testing.T) {
 	if err := os.Chtimes(filepath.Join(dir, "s.jsonl"), old, old); err != nil {
 		t.Fatal(err)
 	}
-	if key, ok := idx.KeyFor(projects, "-new-proj"); !ok || key != "-new-proj" {
-		t.Errorf("stale transcript: KeyFor = %q, %v; want path fallback", key, ok)
+	built, err = Build(projects, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := built.Get("-new-proj"); !ok || e.Key != "-new-proj" {
+		t.Errorf("stale transcript: entry = %+v, %v; want path fallback", e, ok)
 	}
 }
 

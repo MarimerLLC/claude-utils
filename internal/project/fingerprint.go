@@ -3,6 +3,8 @@ package project
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -56,9 +58,9 @@ func Fingerprint(realPath, localHash string) (key string, method Method) {
 }
 
 // repoPrefix returns "" when the repo's current directory is the work-tree top
-// level, else "#<relative/path>" (lowercased, forward slashes, no trailing
-// slash) to distinguish subdirectory projects. Lowercasing keeps the key stable
-// across case-insensitive filesystems where the recorded cwd's casing can vary.
+// level, else "#<relative/path>" (forward slashes, no trailing slash) to
+// distinguish subdirectory projects. Each component is spelled as it is stored
+// on disk (see canonicalCase), not as the cwd happened to be typed.
 func repoPrefix(repo *gitwt.Repo) string {
 	out, err := repo.Run("rev-parse", "--show-prefix")
 	if err != nil {
@@ -68,7 +70,43 @@ func repoPrefix(repo *gitwt.Repo) string {
 	if p == "" {
 		return ""
 	}
-	return "#" + strings.ToLower(p)
+	top, err := repo.Run("rev-parse", "--show-toplevel")
+	if err != nil {
+		return "#" + p
+	}
+	return "#" + canonicalCase(strings.TrimSpace(top), p)
+}
+
+// canonicalCase rewrites each component of rel (slash-separated, below base) to
+// the name as stored on disk. On a case-sensitive filesystem that is the name as
+// given — so repo/docs and repo/Docs stay distinct projects. On a
+// case-insensitive one (Windows, default macOS), where a cwd typed as repo/DOCS
+// still works, it recovers the stored spelling, so the key matches the one
+// other machines derive for the same directory.
+func canonicalCase(base, rel string) string {
+	parts := strings.Split(rel, "/")
+	dir := base
+	for i, part := range parts {
+		if entries, err := os.ReadDir(dir); err == nil {
+			exact := false
+			for _, e := range entries {
+				if e.Name() == part {
+					exact = true
+					break
+				}
+			}
+			if !exact {
+				for _, e := range entries {
+					if strings.EqualFold(e.Name(), part) {
+						parts[i] = e.Name()
+						break
+					}
+				}
+			}
+		}
+		dir = filepath.Join(dir, parts[i])
+	}
+	return strings.Join(parts, "/")
 }
 
 func originURL(repo *gitwt.Repo) (string, bool) {
@@ -109,19 +147,31 @@ func rootCommit(repo *gitwt.Repo) (string, bool) {
 // machines and protocols. All of git@github.com:Acme/app.git,
 // https://github.com/acme/app, and ssh://git@github.com:22/acme/app.git collapse
 // to github.com/acme/app.
+//
+// A port is dropped only when it is the scheme's default (ssh 22, https 443,
+// http 80, git 9418); a non-default port can address a different server, so it
+// stays part of the identity (git.example:2222/acme/app).
 func NormalizeRemoteURL(raw string) string {
 	s := strings.TrimSpace(raw)
 
 	if i := strings.Index(s, "://"); i >= 0 {
 		// scheme://[user@]host[:port]/path
+		scheme := strings.ToLower(s[:i])
 		s = s[i+3:]
 		if at := strings.Index(s, "@"); at >= 0 {
 			if slash := strings.Index(s, "/"); slash < 0 || at < slash {
 				s = s[at+1:]
 			}
 		}
+		if slash := strings.Index(s, "/"); slash > 0 {
+			host, rest := s[:slash], s[slash:]
+			if c := strings.LastIndex(host, ":"); c >= 0 && host[c+1:] == defaultPorts[scheme] {
+				host = host[:c]
+			}
+			s = host + rest
+		}
 	} else if colon := strings.Index(s, ":"); colon >= 0 {
-		// scp-like: [user@]host:path
+		// scp-like: [user@]host:path (this syntax has no port)
 		host := s[:colon]
 		path := s[colon+1:]
 		if at := strings.LastIndex(host, "@"); at >= 0 {
@@ -130,17 +180,13 @@ func NormalizeRemoteURL(raw string) string {
 		s = host + "/" + path
 	}
 
-	// Strip a :port from the host segment (everything before the first slash).
-	if slash := strings.Index(s, "/"); slash > 0 {
-		host, rest := s[:slash], s[slash:]
-		if c := strings.Index(host, ":"); c >= 0 {
-			host = host[:c]
-		}
-		s = host + rest
-	}
-
 	s = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(s, "/"), ".git"), "/")
 	return strings.ToLower(s)
+}
+
+var defaultPorts = map[string]string{
+	"ssh": "22", "git+ssh": "22", "ssh+git": "22",
+	"https": "443", "http": "80", "git": "9418",
 }
 
 // IsFingerprintKey reports whether name is a fingerprint key (g-/r- prefix

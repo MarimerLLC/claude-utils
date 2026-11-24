@@ -19,6 +19,10 @@ func TestNormalizeRemoteURL(t *testing.T) {
 		{"ssh://git@github.com/acme/app.git", "github.com/acme/app"},
 		{"ssh://git@github.com:22/acme/app.git", "github.com/acme/app"},
 		{"https://user:token@github.com/acme/app.git", "github.com/acme/app"},
+		{"https://github.com:443/acme/app", "github.com/acme/app"},
+		{"ssh://git@git.example:2222/acme/app.git", "git.example:2222/acme/app"},
+		{"ssh://git@git.example:2223/acme/app.git", "git.example:2223/acme/app"},
+		{"https://git.example:8443/acme/app", "git.example:8443/acme/app"},
 		{"git@gitlab.example.com:group/sub/repo.git", "gitlab.example.com/group/sub/repo"},
 	}
 	for _, c := range cases {
@@ -168,12 +172,45 @@ func TestFingerprint_SubdirectoryGetsOwnKey(t *testing.T) {
 	dir2 := filepath.Join(t.TempDir(), "elsewhere")
 	initRepoWithCommit(t, dir2)
 	gitCmd(t, dir2, "remote", "add", "origin", "https://github.com/acme/app")
-	sub2 := filepath.Join(dir2, "docs", "guide") // casing differs
+	sub2 := filepath.Join(dir2, "docs", "Guide")
 	if err := os.MkdirAll(sub2, 0700); err != nil {
 		t.Fatal(err)
 	}
 	if k, _ := Fingerprint(sub2, "-sub2"); k != subKey {
 		t.Errorf("same subdir in another clone: key %q, want %q", k, subKey)
+	}
+
+	// On a case-insensitive filesystem the cwd may be recorded with different
+	// casing than the directory has on disk; the key follows the disk.
+	typed := filepath.Join(dir2, "DOCS", "guide")
+	if _, err := os.Stat(typed); err == nil {
+		if k, _ := Fingerprint(typed, "-typed"); k != subKey {
+			t.Errorf("cwd typed as %q: key %q, want %q", typed, k, subKey)
+		}
+	}
+}
+
+// On a case-sensitive filesystem, directories differing only in case are
+// distinct projects and must not share a key.
+func TestFingerprint_CaseDistinctSubdirsOnCaseSensitiveFS(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "repo")
+	initRepoWithCommit(t, dir)
+	gitCmd(t, dir, "remote", "add", "origin", "git@github.com:acme/app.git")
+	lower := filepath.Join(dir, "docs")
+	if err := os.MkdirAll(lower, 0700); err != nil {
+		t.Fatal(err)
+	}
+	upper := filepath.Join(dir, "Docs")
+	if _, err := os.Stat(upper); err == nil {
+		t.Skip("case-insensitive filesystem")
+	}
+	if err := os.MkdirAll(upper, 0700); err != nil {
+		t.Fatal(err)
+	}
+	kl, _ := Fingerprint(lower, "-l")
+	ku, _ := Fingerprint(upper, "-u")
+	if kl == ku {
+		t.Errorf("docs and Docs share key %q", kl)
 	}
 }
 

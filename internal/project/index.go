@@ -130,26 +130,6 @@ func isDir(p string) bool {
 	return err == nil && info.IsDir()
 }
 
-// KeyFor returns the mirror key for a local project directory, computing and
-// caching it on a miss (so the daemon's incremental path doesn't need a full
-// rebuild when a new project appears mid-session). ok is false when the
-// project can't be keyed yet (see Build); nothing is cached then, so the next
-// call tries again.
-func (idx *Index) KeyFor(claudeProjectsDir, localHash string) (key string, ok bool) {
-	if e, ok := idx.byLocal[localHash]; ok {
-		return e.Key, true
-	}
-	if IsFingerprintKey(localHash) {
-		return "", false
-	}
-	e, pending := resolveEntry(claudeProjectsDir, localHash, nil)
-	if pending {
-		return "", false
-	}
-	idx.byLocal[localHash] = e
-	return e.Key, true
-}
-
 // Set records an entry directly. Reconcile uses it for path-keyed projects it
 // materializes from the mirror, so later events for them resolve from cache.
 func (idx *Index) Set(localHash string, e Entry) { idx.byLocal[localHash] = e }

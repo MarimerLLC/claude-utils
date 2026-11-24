@@ -48,10 +48,16 @@ type SyncReport struct {
 	PrunedLegacy      []string // legacy path-keyed mirror files removed after import
 }
 
-// ErrProjectPending is returned by the incremental copy helpers when a project
-// can't be mapped to a sync key yet (Claude hasn't recorded its cwd). Nothing
-// is written; a later reconcile picks the project up.
-var ErrProjectPending = errors.New("project not yet resolvable to a sync key")
+// ErrNeedsReconcile is returned by the incremental helpers (CopyToMirror,
+// RemoveFromMirror) when a change can't safely be applied on its own and needs
+// a full Reconcile, which merges or keeps backups instead of overwriting.
+// Nothing is written. That covers:
+//   - a project not in the index yet — newly opened here (its mirror key may
+//     already hold memories from another PC that a blind copy would clobber),
+//     or still waiting for Claude to record its cwd;
+//   - a sibling checkout of the same project whose copy differs from the
+//     mirror — it has its own unsynced edit, which a fan-out would destroy.
+var ErrNeedsReconcile = errors.New("change needs a full reconcile")
 
 // Reconcile performs a bidirectional sync between the two trees, using the
 // manifest to distinguish "user deleted this" from "this is new from
@@ -157,7 +163,11 @@ func reconcileKey(r Roots, key string, locals []string, manifest *Manifest, rep 
 			return fmt.Errorf("read claude %s: %w", claudeMem, err)
 		}
 	}
-	_ = listMemoryFiles(mirrorMem, names) // a missing/unreadable mirror dir just contributes nothing
+	// A missing mirror dir contributes nothing; any other read error must stop
+	// the pass rather than look like an empty dir whose files we'd overwrite.
+	if err := listMemoryFiles(mirrorMem, names); err != nil {
+		return fmt.Errorf("read mirror %s: %w", mirrorMem, err)
+	}
 
 	sorted := make([]string, 0, len(names))
 	for n := range names {
@@ -183,7 +193,7 @@ func listMemoryFiles(dir string, into map[string]struct{}) error {
 		return err
 	}
 	for _, e := range entries {
-		if e.IsDir() || strings.HasPrefix(e.Name(), ".") || strings.Contains(e.Name(), ".from-remote-") {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") || isCollisionBackup(e.Name()) {
 			continue
 		}
 		into[e.Name()] = struct{}{}
@@ -300,28 +310,53 @@ func reconcileFile(r Roots, mirrorMem string, locals []string, name string, mani
 // other local checkouts of the same project so they never diverge. Used by the
 // watcher loop on a file change. Writes are skipped when content already
 // matches, which also stops the echo events those writes cause from looping.
+//
+// It returns ErrNeedsReconcile, writing nothing, when the project isn't indexed
+// yet or a sibling checkout holds its own unsynced version of the file.
 func CopyToMirror(r Roots, idx *project.Index, localHash, name string) error {
-	key, ok := idx.KeyFor(r.Claude, localHash)
+	entry, ok := idx.Get(localHash)
 	if !ok {
-		return ErrProjectPending
+		return ErrNeedsReconcile
 	}
-	src := filepath.Join(r.Claude, localHash, "memory", name)
-	b, err := os.ReadFile(src)
+	b, err := os.ReadFile(filepath.Join(r.Claude, localHash, "memory", name))
 	if err != nil {
 		return err
 	}
-	if _, err := writeIfChanged(filepath.Join(r.Mirror, key, "memory", name), b); err != nil {
+	dst := filepath.Join(r.Mirror, entry.Key, "memory", name)
+	siblings, ok := siblingsInSync(r, idx, entry.Key, localHash, name)
+	if !ok {
+		return ErrNeedsReconcile
+	}
+	if _, err := writeIfChanged(dst, b); err != nil {
 		return err
 	}
-	for _, other := range idx.LocalsFor(key) {
-		if other == localHash {
-			continue
-		}
-		if _, err := writeIfChanged(filepath.Join(r.Claude, other, "memory", name), b); err != nil {
+	for _, p := range siblings {
+		if _, err := writeIfChanged(p, b); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// siblingsInSync returns the file's paths in the other local checkouts mapping
+// to key, and whether every one of them still matches the mirror's current copy
+// (same content, or both absent) — i.e. none has an edit of its own that an
+// incremental copy or delete would discard.
+func siblingsInSync(r Roots, idx *project.Index, key, localHash, name string) ([]string, bool) {
+	mExists, mBytes := readIfExists(filepath.Join(r.Mirror, key, "memory", name))
+	var paths []string
+	for _, other := range idx.LocalsFor(key) {
+		if other == localHash {
+			continue
+		}
+		p := filepath.Join(r.Claude, other, "memory", name)
+		ex, b := readIfExists(p)
+		if ex != mExists || (ex && !bytes.Equal(b, mBytes)) {
+			return nil, false
+		}
+		paths = append(paths, p)
+	}
+	return paths, true
 }
 
 // CopyToClaude copies a single mirror-side file (addressed by fingerprint key)
@@ -351,21 +386,23 @@ func CopyToClaude(r Roots, idx *project.Index, key, name string) (int, error) {
 // deletion, plus the copies in any other local checkouts of the project.
 //
 // Remove/Rename events also fire when a file is atomically replaced; if the
-// file is still there it wasn't deleted, so it is copied instead.
+// file is still there it wasn't deleted, so it is copied instead. Like
+// CopyToMirror it returns ErrNeedsReconcile when the project isn't indexed or a
+// sibling checkout has edited the file — Reconcile then lets that edit outrank
+// the delete instead of discarding it.
 func RemoveFromMirror(r Roots, idx *project.Index, localHash, name string) error {
-	key, ok := idx.KeyFor(r.Claude, localHash)
+	entry, ok := idx.Get(localHash)
 	if !ok {
-		return ErrProjectPending
+		return ErrNeedsReconcile
 	}
 	if _, err := os.Stat(filepath.Join(r.Claude, localHash, "memory", name)); err == nil {
 		return CopyToMirror(r, idx, localHash, name)
 	}
-	targets := []string{filepath.Join(r.Mirror, key, "memory", name)}
-	for _, other := range idx.LocalsFor(key) {
-		if other != localHash {
-			targets = append(targets, filepath.Join(r.Claude, other, "memory", name))
-		}
+	siblings, ok := siblingsInSync(r, idx, entry.Key, localHash, name)
+	if !ok {
+		return ErrNeedsReconcile
 	}
+	targets := append([]string{filepath.Join(r.Mirror, entry.Key, "memory", name)}, siblings...)
 	for _, t := range targets {
 		if err := os.Remove(t); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err

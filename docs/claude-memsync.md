@@ -175,7 +175,20 @@ home, say) doesn't take on that repo's identity.
 Several local projects can map to one key — the same repo checked out twice on
 one machine, e.g. as **git worktrees**. They share one memory set: an edit in
 one checkout is copied to the others straight away, and reconcile keeps them
-identical.
+identical. If two checkouts change the same file before the daemon catches up,
+nothing is overwritten: the next flush reconciles them (`MEMORY.md` merged,
+other files kept with a `.from-remote-*` backup), and an edit outranks a
+delete of the same file.
+
+A project opened here for the first time is reconciled before its first local
+write goes to the mirror, so memories already synced from another PC are
+merged in rather than overwritten.
+
+Remote URLs keep a non-default port (`git.example:2222/…` is not
+`git.example/…`), and the subdirectory part of a key follows each directory's
+name as stored on disk — so `docs` and `Docs` stay separate on a case-sensitive
+filesystem, while a cwd typed with different casing on Windows or macOS still
+matches.
 
 A per-PC index at `~/.claudesync/.state/index.json` (gitignored) records the
 `localHash → key` mapping. It routes inbound changes back to the right local

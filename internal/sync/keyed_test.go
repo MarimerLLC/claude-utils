@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -200,6 +201,29 @@ func TestMigrateLayout_SkipsPriorVersions(t *testing.T) {
 	}
 }
 
+// Collision backups in a legacy dir are recovery files, not memories: carried
+// over verbatim (never merged), and only then pruned from the legacy dir.
+func TestMigrateLayout_CarriesCollisionBackupsVerbatim(t *testing.T) {
+	r, root := reconcileFixture(t)
+	idx, key := fingerprintedProject(t, r, root, "-home-matta-app")
+	const backup = "feedback_a.md.from-remote-0123abcd"
+	writeMem(t, r.Mirror, "-home-matta-app", backup, "recovered")
+
+	rep, err := MigrateLayout(r, idx, MigrateOptions{State: NewMigrationState(), Prune: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readMem(t, r.Mirror, key, backup); got != "recovered" {
+		t.Errorf("backup not carried over verbatim: %q", got)
+	}
+	if n := len(rep.Merged) + len(rep.BackedUp); n != 0 {
+		t.Errorf("backup must not be merged or re-backed-up; got %#v", rep)
+	}
+	if memExists(t, r.Mirror, "-home-matta-app", backup) {
+		t.Errorf("legacy copy should be pruned once carried over")
+	}
+}
+
 func TestMigrateLayout_PruneRemovesOnlyImported(t *testing.T) {
 	r, root := reconcileFixture(t)
 	idx, key := fingerprintedProject(t, r, root, "-home-matta-app")
@@ -311,6 +335,143 @@ func TestReconcile_SiblingCheckoutsConverge(t *testing.T) {
 	}
 	if memExists(t, r.Claude, "-wt-b", "feedback_x.md") || memExists(t, r.Mirror, key, "feedback_x.md") {
 		t.Errorf("delete in one checkout was undone by its sibling")
+	}
+}
+
+// The first write in a project opened here for the first time must not
+// overwrite memories another PC already synced under its key: the incremental
+// path defers to Reconcile, which merges.
+func TestCopyToMirror_NewProjectDefersToReconcile(t *testing.T) {
+	r, root := reconcileFixture(t)
+	idx, key := fingerprintedProject(t, r, root, "-p")
+	writeMem(t, r.Mirror, key, "MEMORY.md", "# App\n\n## FromOtherPC\nremote\n")
+
+	// A project the index doesn't know yet (opened mid-session).
+	repo := filepath.Join(root, "repo-new")
+	makeRepo(t, repo, "git@github.com:acme/app.git")
+	makeClaudeProject(t, r.Claude, "-new", repo)
+	writeMem(t, r.Claude, "-new", "MEMORY.md", "# App\n\n## Local\nlocal\n")
+
+	if err := CopyToMirror(r, idx, "-new", "MEMORY.md"); !errors.Is(err, ErrNeedsReconcile) {
+		t.Fatalf("CopyToMirror on unindexed project = %v; want ErrNeedsReconcile", err)
+	}
+	if s := readMem(t, r.Mirror, key, "MEMORY.md"); contains(s, "## Local") || !contains(s, "## FromOtherPC") {
+		t.Fatalf("mirror changed before reconcile: %q", s)
+	}
+
+	// What the debounced flush then does: re-index and reconcile.
+	idx, err := project.Build(r.Claude, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reconcile(r, idx, NewManifest()); err != nil {
+		t.Fatal(err)
+	}
+	if s := readMem(t, r.Mirror, key, "MEMORY.md"); !contains(s, "## Local") || !contains(s, "## FromOtherPC") {
+		t.Errorf("reconcile lost a side: %q", s)
+	}
+}
+
+// siblingPair sets up two checkouts of one repo (worktrees) sharing a key, with
+// the mirror and both checkouts holding base for name.
+func siblingPair(t *testing.T, name, base string) (Roots, *project.Index, string) {
+	t.Helper()
+	r, root := reconcileFixture(t)
+	for _, lh := range []string{"-wt-a", "-wt-b"} {
+		repo := filepath.Join(root, lh)
+		makeRepo(t, repo, "git@github.com:acme/app.git")
+		makeClaudeProject(t, r.Claude, lh, repo)
+		writeMem(t, r.Claude, lh, name, base)
+	}
+	idx, err := project.Build(r.Claude, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _ := idx.Get("-wt-a")
+	writeMem(t, r.Mirror, e.Key, name, base)
+	return r, idx, e.Key
+}
+
+// Both checkouts edited before the watcher handled either: the first event
+// must not overwrite the other checkout's edit.
+func TestCopyToMirror_DivergentSiblingIsNotOverwritten(t *testing.T) {
+	r, idx, key := siblingPair(t, "MEMORY.md", "# App\n")
+	writeMem(t, r.Claude, "-wt-a", "MEMORY.md", "# App\n\n## A\na\n")
+	writeMem(t, r.Claude, "-wt-b", "MEMORY.md", "# App\n\n## B\nb\n")
+
+	if err := CopyToMirror(r, idx, "-wt-a", "MEMORY.md"); !errors.Is(err, ErrNeedsReconcile) {
+		t.Fatalf("CopyToMirror with divergent sibling = %v; want ErrNeedsReconcile", err)
+	}
+	if s := readMem(t, r.Claude, "-wt-b", "MEMORY.md"); !contains(s, "## B") {
+		t.Fatalf("sibling edit overwritten: %q", s)
+	}
+
+	manifest, err := BuildFromClaudeTree(r.Claude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reconcile(r, idx, manifest); err != nil {
+		t.Fatal(err)
+	}
+	for _, where := range []string{
+		readMem(t, r.Claude, "-wt-a", "MEMORY.md"),
+		readMem(t, r.Claude, "-wt-b", "MEMORY.md"),
+		readMem(t, r.Mirror, key, "MEMORY.md"),
+	} {
+		if !contains(where, "## A") || !contains(where, "## B") {
+			t.Errorf("reconcile did not keep both edits: %q", where)
+		}
+	}
+}
+
+// A delete in one checkout while the other has edited the file must not
+// discard the edit: the edit outranks the delete.
+func TestRemoveFromMirror_EditedSiblingOutranksDelete(t *testing.T) {
+	r, idx, key := siblingPair(t, "feedback_x.md", "base")
+	manifest, err := BuildFromClaudeTree(r.Claude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(r.Claude, "-wt-a", "memory", "feedback_x.md")); err != nil {
+		t.Fatal(err)
+	}
+	writeMem(t, r.Claude, "-wt-b", "feedback_x.md", "edited")
+
+	if err := RemoveFromMirror(r, idx, "-wt-a", "feedback_x.md"); !errors.Is(err, ErrNeedsReconcile) {
+		t.Fatalf("RemoveFromMirror with edited sibling = %v; want ErrNeedsReconcile", err)
+	}
+	if got := readMem(t, r.Claude, "-wt-b", "feedback_x.md"); got != "edited" {
+		t.Fatalf("sibling edit discarded: %q", got)
+	}
+	if _, err := Reconcile(r, idx, manifest); err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range []string{
+		readMem(t, r.Claude, "-wt-a", "feedback_x.md"),
+		readMem(t, r.Mirror, key, "feedback_x.md"),
+	} {
+		if got != "edited" {
+			t.Errorf("edit should be restored everywhere; got %q", got)
+		}
+	}
+}
+
+// A mirror memory dir that can't be read must fail the pass, not be treated as
+// empty (which would let local content overwrite unread mirror files).
+func TestReconcile_MirrorReadErrorPropagates(t *testing.T) {
+	r, root := reconcileFixture(t)
+	idx, key := fingerprintedProject(t, r, root, "-p")
+	writeMem(t, r.Claude, "-p", "MEMORY.md", "# local\n")
+	// A file where the memory dir should be: ReadDir fails with something other
+	// than not-exist on every platform.
+	if err := os.MkdirAll(filepath.Join(r.Mirror, key), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(r.Mirror, key, "memory"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reconcile(r, idx, NewManifest()); err == nil {
+		t.Errorf("expected an error for an unreadable mirror dir")
 	}
 }
 

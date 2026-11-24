@@ -107,6 +107,16 @@ func MigrateLayout(r Roots, idx *project.Index, opt MigrateOptions) (SyncReport,
 			newPath := filepath.Join(newMem, name)
 			newExists, newBytes := readIfExists(newPath)
 			switch {
+			case isCollisionBackup(name):
+				// A .from-remote-* recovery copy is not a memory: never merge or
+				// re-back it up. Carry it over verbatim (names are unique) so it
+				// stays recoverable under the key — pruning removes the legacy
+				// copy only after this one exists.
+				if !newExists {
+					if err := writeFile(newPath, oldBytes); err != nil {
+						return rep, err
+					}
+				}
 			case newExists && bytes.Equal(oldBytes, newBytes):
 				// identical — nothing to do
 			case opt.Prior != nil && opt.Prior(rel, oldBytes):
@@ -154,6 +164,10 @@ func MigrateLayout(r Roots, idx *project.Index, opt MigrateOptions) (SyncReport,
 	}
 	return rep, nil
 }
+
+// isCollisionBackup reports whether name is a .from-remote-* backup written on
+// a collision (Reconcile and the mirror walk skip these as non-memories).
+func isCollisionBackup(name string) bool { return strings.Contains(name, ".from-remote-") }
 
 func contentSum(b []byte) string {
 	s := sha256.Sum256(b)

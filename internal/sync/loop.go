@@ -29,16 +29,17 @@ type Loop struct {
 	OnFlush  func(localChanges bool, err error) // optional, for tests/observability
 
 	// idx maps localHash → fingerprint key for the current Claude tree. Seeded
-	// from the saved index at startup, rebuilt then and on the pull tick, and
-	// filled lazily for projects that appear mid-session. The loop is
-	// single-goroutine, so no locking is needed.
+	// from the saved index at startup and rebuilt then, on the pull tick, and
+	// whenever an event needs a full reconcile (e.g. a project opened
+	// mid-session). The loop is single-goroutine, so no locking is needed.
 	idx *project.Index
 
 	// migState records legacy mirror files already imported (see MigrateLayout).
 	migState *MigrationState
 
-	// needReconcile is set when a watcher event hit a project that couldn't be
-	// keyed yet; the next debounced flush reconciles before committing.
+	// needReconcile is set when a watcher event couldn't be applied
+	// incrementally (ErrNeedsReconcile); the next debounced flush reconciles
+	// before committing.
 	needReconcile bool
 }
 
@@ -160,8 +161,10 @@ func (l *Loop) Run(ctx context.Context) error {
 
 		case <-debounce.C:
 			if l.needReconcile {
-				// An event hit a project with no key yet; resolve what we can and
-				// reconcile so its change isn't left waiting for the pull tick.
+				// An event couldn't be applied incrementally (new project, or a
+				// sibling checkout with its own edit); re-index and reconcile so
+				// the change merges instead of overwriting, without waiting for
+				// the pull tick.
 				l.needReconcile = false
 				l.rebuildIndex(roots)
 				m, err := LoadManifest(l.Cfg.SyncDir)
@@ -267,9 +270,9 @@ func (l *Loop) handleEvent(watcher *fsnotify.Watcher, roots Roots, ev fsnotify.E
 	default:
 		return false, nil
 	}
-	if errors.Is(opErr, ErrProjectPending) {
-		// Not keyable yet (Claude hasn't recorded the project's cwd). Don't
-		// guess a key; reconcile on the debounced flush instead.
+	if errors.Is(opErr, ErrNeedsReconcile) {
+		// A new/unkeyed project, or a sibling checkout with its own edit: don't
+		// copy blindly; reconcile (merge / back up) on the debounced flush.
 		l.needReconcile = true
 		return true, nil
 	}
