@@ -112,6 +112,91 @@ func TestMerge_DuplicateHeadingsMatchByOccurrence(t *testing.T) {
 	}
 }
 
+// Deleting an earlier copy must not shift the later copies onto the wrong
+// counterpart. Matching by position alone paired ours' surviving "second" with
+// base's "first", so theirs' edit to "second" came back next to the stale
+// original, with no conflict reported.
+func TestMerge_DuplicateDeletedOnOneSideEditedOnOther(t *testing.T) {
+	base := "## Notes\nfirst\n\n## Notes\nsecond\n"
+	ours := "## Notes\nsecond\n"
+	theirs := "## Notes\nfirst\n\n## Notes\nsecond edited by them\n"
+
+	got, conflict := Merge(base, ours, theirs)
+	want := "## Notes\nsecond edited by them\n"
+	if conflict || got != want {
+		t.Fatalf("got (%v) %q, want %q", conflict, got, want)
+	}
+}
+
+func TestMerge_DuplicateDeletedOnOneSideUntouchedOnOther(t *testing.T) {
+	base := "## Notes\nfirst\n\n## Notes\nsecond\n"
+	ours := "## Notes\nsecond\n"
+
+	got, conflict := Merge(base, ours, base)
+	if conflict || got != ours {
+		t.Fatalf("got (%v) %q, want %q", conflict, got, ours)
+	}
+}
+
+// Inserting a new copy above an existing one must not pair the new copy with
+// the old one. Matching by position alone reported a conflict between "new"
+// and theirs' edit and kept a stale copy of "first" as well.
+func TestMerge_DuplicateInsertedAboveEditedCopy(t *testing.T) {
+	base := "## Notes\nfirst\n"
+	ours := "## Notes\nnew\n\n## Notes\nfirst\n"
+	theirs := "## Notes\nfirst edited by them\n"
+
+	got, conflict := Merge(base, ours, theirs)
+	want := "## Notes\nnew\n\n## Notes\nfirst edited by them\n"
+	if conflict || got != want {
+		t.Fatalf("got (%v) %q, want %q", conflict, got, want)
+	}
+}
+
+// Reconcile merges with an empty base, so copies are matched between ours and
+// theirs directly: a copy both sides have is kept once, extra copies are kept.
+func TestMerge_DuplicatesWithEmptyBase(t *testing.T) {
+	ours := "## Notes\nb\n"
+	theirs := "## Notes\na\n\n## Notes\nb\n"
+
+	got, conflict := Merge("", ours, theirs)
+	if conflict {
+		t.Fatalf("unexpected conflict: %q", got)
+	}
+	if strings.Count(got, "## Notes") != 2 || strings.Count(got, "b\n") != 1 || !strings.Contains(got, "a\n") {
+		t.Fatalf("want one copy each of a and b, got %q", got)
+	}
+}
+
+// Both sides adding the same new copy keeps it once, as for any other section.
+func TestMerge_SameDuplicateAddedOnBothSides(t *testing.T) {
+	base := "## Notes\na\n"
+	both := "## Notes\na\n\n## Notes\nb\n"
+
+	got, conflict := Merge(base, both, both)
+	if conflict || got != both {
+		t.Fatalf("got (%v) %q, want %q", conflict, got, both)
+	}
+}
+
+// When both sides change the copies so no copy anchors the alignment, the
+// overlap must surface as a conflict rather than disappear.
+func TestMerge_DuplicatesBothChangedSurfaceConflict(t *testing.T) {
+	base := "## Notes\na\n\n## Notes\nb\n"
+	ours := "## Notes\na edited\n\n## Notes\nb\n"
+	theirs := "## Notes\nb edited\n"
+
+	got, conflict := Merge(base, ours, theirs)
+	if !conflict {
+		t.Fatalf("expected a conflict, got %q", got)
+	}
+	for _, want := range []string{"a edited", "b edited"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lost %q: %q", want, got)
+		}
+	}
+}
+
 func TestMerge_BothAddDisjointSections(t *testing.T) {
 	base := "# Project\n"
 	ours := "# Project\n\n## Deploy\nuse helm.\n"
