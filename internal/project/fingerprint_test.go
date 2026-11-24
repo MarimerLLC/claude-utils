@@ -44,8 +44,15 @@ func TestNormalizeRemoteURL_EquivalentFormsCollapse(t *testing.T) {
 }
 
 func TestIsFingerprintKey(t *testing.T) {
-	yes := []string{"g-abc123", "r-deadbeef"}
-	no := []string{"-Users-me-code-foo", "proj1", "-home-matta-repos-foo"}
+	yes := []string{"g-0123456789ab", "r-deadbeefcafe"}
+	no := []string{
+		"-Users-me-code-foo", "proj1", "-home-matta-repos-foo",
+		"g--src-app",       // Windows project on a lowercase g: drive
+		"r--repos-x",       // ... and on r:
+		"g-abc123",         // wrong length
+		"g-0123456789AB",   // uppercase is not ours
+		"g-0123456789abcd", // too long
+	}
 	for _, s := range yes {
 		if !IsFingerprintKey(s) {
 			t.Errorf("IsFingerprintKey(%q) = false, want true", s)
@@ -130,6 +137,43 @@ func TestFingerprint_RootCommitFallback(t *testing.T) {
 	key2, method2 := Fingerprint(clone, "-clone")
 	if method2 != MethodRoot || key2 != key {
 		t.Errorf("clone key/method = %q/%q, want %q/root", key2, method2, key)
+	}
+}
+
+// A Claude project opened in a subdirectory of a repo is a distinct project
+// from the repo root, and a plain folder nested in some enclosing repo must not
+// take on that repo's root identity.
+func TestFingerprint_SubdirectoryGetsOwnKey(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "repo")
+	initRepoWithCommit(t, dir)
+	gitCmd(t, dir, "remote", "add", "origin", "git@github.com:acme/app.git")
+	sub := filepath.Join(dir, "docs", "Guide")
+	if err := os.MkdirAll(sub, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	rootKey, _ := Fingerprint(dir, "-root")
+	subKey, method := Fingerprint(sub, "-sub")
+	if method != MethodRemote {
+		t.Fatalf("subdir method = %q, want remote", method)
+	}
+	if subKey == rootKey {
+		t.Fatalf("subdirectory shares the repo root's key %q", rootKey)
+	}
+	if !IsFingerprintKey(subKey) {
+		t.Errorf("subdir key %q is not a fingerprint key", subKey)
+	}
+
+	// The same subdirectory of another clone (different absolute path) matches.
+	dir2 := filepath.Join(t.TempDir(), "elsewhere")
+	initRepoWithCommit(t, dir2)
+	gitCmd(t, dir2, "remote", "add", "origin", "https://github.com/acme/app")
+	sub2 := filepath.Join(dir2, "docs", "guide") // casing differs
+	if err := os.MkdirAll(sub2, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if k, _ := Fingerprint(sub2, "-sub2"); k != subKey {
+		t.Errorf("same subdir in another clone: key %q, want %q", k, subKey)
 	}
 }
 

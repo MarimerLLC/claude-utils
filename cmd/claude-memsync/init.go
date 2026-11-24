@@ -132,17 +132,33 @@ func bootstrap(cfg config.Config, force bool) error {
 	}
 	roots := syncpkg.Roots{Claude: cfg.ClaudeProjectsDir, Mirror: mirrorProjects}
 
-	// Build the fingerprint index and migrate any legacy path-keyed dirs the
+	// Build the fingerprint index and import any legacy path-keyed dirs the
 	// remote already carries (from a pre-fingerprint version or another machine)
-	// to their fingerprint keys before reconciling local memories in.
-	idx, err := project.Build(cfg.ClaudeProjectsDir)
+	// into their fingerprint keys before reconciling local memories in. Legacy
+	// dirs are kept (see MigrateLayout) unless pruneLegacyDirs is set.
+	prevIdx, err := project.Load(cfg.SyncDir)
+	if err != nil {
+		prevIdx = nil // unreadable saved index: rebuild from scratch
+	}
+	idx, err := project.Build(cfg.ClaudeProjectsDir, prevIdx)
 	if err != nil {
 		return fmt.Errorf("build project index: %w", err)
 	}
-	if migRep, err := syncpkg.MigrateLayout(roots, idx); err != nil {
+	migState, err := syncpkg.LoadMigrationState(cfg.SyncDir)
+	if err != nil {
+		migState = syncpkg.NewMigrationState()
+	}
+	migRep, err := syncpkg.MigrateLayout(roots, idx, syncpkg.MigrateOptions{
+		State: migState,
+		Prior: syncpkg.PriorVersionIn(repo),
+		Prune: cfg.PruneLegacyDirs,
+	})
+	if err != nil {
 		return fmt.Errorf("migrate layout: %w", err)
-	} else {
-		printReport(migRep)
+	}
+	printReport(migRep)
+	if err := migState.Save(cfg.SyncDir); err != nil {
+		fmt.Fprintln(os.Stderr, "save migration state:", err)
 	}
 
 	// First-time init: no manifest yet. Pass nil so Reconcile doesn't try
@@ -272,5 +288,14 @@ func printReport(r syncpkg.SyncReport) {
 	}
 	if len(r.BackedUp) > 0 {
 		fmt.Fprintf(os.Stderr, "%d collisions saved as .from-remote-* in the mirror\n", len(r.BackedUp))
+	}
+	if len(r.RemovedFromMirror) > 0 {
+		fmt.Fprintf(os.Stderr, "removed %d deleted files from the mirror\n", len(r.RemovedFromMirror))
+	}
+	if len(r.RemovedFromClaude) > 0 {
+		fmt.Fprintf(os.Stderr, "removed %d deleted files from other local checkouts\n", len(r.RemovedFromClaude))
+	}
+	if len(r.PrunedLegacy) > 0 {
+		fmt.Fprintf(os.Stderr, "pruned %d legacy path-keyed mirror files\n", len(r.PrunedLegacy))
 	}
 }

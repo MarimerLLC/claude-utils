@@ -32,19 +32,43 @@ const (
 //
 // Preference order: normalized origin remote URL, then git root-commit SHA when
 // there is no remote, then the path fallback.
+//
+// When realPath is a subdirectory of the work-tree rather than its top level,
+// the path relative to the top level is folded into the key. Claude keeps a
+// separate project (and memory) per directory, so a session in repo/docs must
+// not share memories with one at the repo root — and a plain folder that merely
+// sits inside some enclosing repo (a dotfiles-managed home, say) must not take
+// on that repo's identity.
 func Fingerprint(realPath, localHash string) (key string, method Method) {
 	if realPath != "" {
 		repo := gitwt.New(realPath)
 		if repo.IsRepo() {
+			sub := repoPrefix(repo)
 			if url, ok := originURL(repo); ok {
-				return remotePrefix + shortHash(NormalizeRemoteURL(url)), MethodRemote
+				return remotePrefix + shortHash(NormalizeRemoteURL(url)+sub), MethodRemote
 			}
 			if root, ok := rootCommit(repo); ok {
-				return rootPrefix + shortHash(root), MethodRoot
+				return rootPrefix + shortHash(root+sub), MethodRoot
 			}
 		}
 	}
 	return localHash, MethodPath
+}
+
+// repoPrefix returns "" when the repo's current directory is the work-tree top
+// level, else "#<relative/path>" (lowercased, forward slashes, no trailing
+// slash) to distinguish subdirectory projects. Lowercasing keeps the key stable
+// across case-insensitive filesystems where the recorded cwd's casing can vary.
+func repoPrefix(repo *gitwt.Repo) string {
+	out, err := repo.Run("rev-parse", "--show-prefix")
+	if err != nil {
+		return ""
+	}
+	p := strings.Trim(strings.ReplaceAll(strings.TrimSpace(out), `\`, "/"), "/")
+	if p == "" {
+		return ""
+	}
+	return "#" + strings.ToLower(p)
 }
 
 func originURL(repo *gitwt.Repo) (string, bool) {
@@ -119,15 +143,37 @@ func NormalizeRemoteURL(raw string) string {
 	return strings.ToLower(s)
 }
 
-// IsFingerprintKey reports whether name is a fingerprint key (g-/r- prefixed)
-// rather than a legacy path key. A fingerprint key can't be reversed to a local
-// path, so a mirror dir with one and no matching local project must wait to
-// materialize until that project is opened here.
+// IsFingerprintKey reports whether name is a fingerprint key (g-/r- prefix
+// followed by exactly shortHashLen lowercase hex digits) rather than a legacy
+// path key. The exact shape matters: a Windows project on a lowercase drive
+// letter encodes as e.g. "g--src-app", which must stay a path key. A fingerprint
+// key can't be reversed to a local path, so a mirror dir with one and no
+// matching local project must wait to materialize until that project is opened
+// here.
 func IsFingerprintKey(name string) bool {
-	return strings.HasPrefix(name, remotePrefix) || strings.HasPrefix(name, rootPrefix)
+	var rest string
+	switch {
+	case strings.HasPrefix(name, remotePrefix):
+		rest = name[len(remotePrefix):]
+	case strings.HasPrefix(name, rootPrefix):
+		rest = name[len(rootPrefix):]
+	default:
+		return false
+	}
+	if len(rest) != shortHashLen {
+		return false
+	}
+	for _, c := range rest {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
+
+const shortHashLen = 12
 
 func shortHash(s string) string {
 	sum := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(sum[:])[:12]
+	return hex.EncodeToString(sum[:])[:shortHashLen]
 }

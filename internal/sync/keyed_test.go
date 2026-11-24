@@ -69,7 +69,7 @@ func TestReconcile_TwoPathsSameRepoUnionInMirror(t *testing.T) {
 	writeMem(t, r.Claude, "-Users-me-app", "MEMORY.md", "# App\n\n## FromMac\nmac\n")
 	writeMem(t, r.Claude, "-home-matta-app", "MEMORY.md", "# App\n\n## FromLinux\nlinux\n")
 
-	idx, err := project.Build(r.Claude)
+	idx, err := project.Build(r.Claude, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,54 +98,232 @@ func TestReconcile_TwoPathsSameRepoUnionInMirror(t *testing.T) {
 	}
 }
 
-// TestMigrateLayout_CollapsesLegacyDirs seeds a legacy path-keyed mirror dir and
-// a colliding fingerprint-keyed dir (as if another machine already migrated),
-// then asserts they union under the fingerprint key and the legacy dir is gone.
-func TestMigrateLayout_CollapsesLegacyDirs(t *testing.T) {
-	r, root := reconcileFixture(t)
-	repo := filepath.Join(root, "app")
+// fingerprintedProject sets up one git-backed Claude project and returns its
+// index and key.
+func fingerprintedProject(t *testing.T, r Roots, root, localHash string) (*project.Index, string) {
+	t.Helper()
+	repo := filepath.Join(root, "repo-"+localHash)
 	makeRepo(t, repo, "git@github.com:acme/app.git")
-	makeClaudeProject(t, r.Claude, "-home-matta-app", repo)
-
-	idx, err := project.Build(r.Claude)
+	makeClaudeProject(t, r.Claude, localHash, repo)
+	idx, err := project.Build(r.Claude, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry, _ := idx.Get("-home-matta-app")
-	key := entry.Key
-	if !project.IsFingerprintKey(key) {
-		t.Fatalf("expected a fingerprint key, got %q", key)
+	entry, _ := idx.Get(localHash)
+	if !project.IsFingerprintKey(entry.Key) {
+		t.Fatalf("expected a fingerprint key, got %q", entry.Key)
 	}
+	return idx, entry.Key
+}
 
-	// Legacy path-keyed dir from before the upgrade on this machine.
+func readMem(t *testing.T, root, hash, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(root, hash, "memory", name))
+	if err != nil {
+		t.Fatalf("read %s/%s: %v", hash, name, err)
+	}
+	return string(b)
+}
+
+// TestMigrateLayout_UnionsAndKeepsLegacyDir seeds a legacy path-keyed mirror
+// dir and a colliding fingerprint-keyed dir (as if another machine already
+// migrated), then asserts they union under the fingerprint key — and that the
+// legacy dir is left in place, since a PC still on the old version would read
+// its deletion as the user deleting those memories.
+func TestMigrateLayout_UnionsAndKeepsLegacyDir(t *testing.T) {
+	r, root := reconcileFixture(t)
+	idx, key := fingerprintedProject(t, r, root, "-home-matta-app")
+
 	writeMem(t, r.Mirror, "-home-matta-app", "MEMORY.md", "# App\n\n## Legacy\nold\n")
-	// Fingerprint-keyed dir already present (other machine migrated + pushed).
 	writeMem(t, r.Mirror, key, "MEMORY.md", "# App\n\n## Other\nnew\n")
 
-	rep, err := MigrateLayout(r, idx)
+	state := NewMigrationState()
+	rep, err := MigrateLayout(r, idx, MigrateOptions{State: state})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rep.Merged) != 1 {
 		t.Errorf("expected one merged file; got %#v", rep)
 	}
-	got, err := os.ReadFile(filepath.Join(r.Mirror, key, "memory", "MEMORY.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s := string(got); !contains(s, "## Legacy") || !contains(s, "## Other") {
+	if s := readMem(t, r.Mirror, key, "MEMORY.md"); !contains(s, "## Legacy") || !contains(s, "## Other") {
 		t.Errorf("migration did not union sections; got %q", s)
 	}
-	if _, err := os.Stat(filepath.Join(r.Mirror, "-home-matta-app")); err == nil {
-		t.Errorf("legacy mirror dir should have been removed")
+	if !memExists(t, r.Mirror, "-home-matta-app", "MEMORY.md") {
+		t.Errorf("legacy mirror dir must be kept unless pruning")
 	}
 
-	// Idempotent: a second run has nothing to migrate and must not error.
-	rep2, err := MigrateLayout(r, idx)
+	// The user then deletes the Legacy section under the key. Re-running with
+	// the same state must not merge the unchanged legacy file back in.
+	writeMem(t, r.Mirror, key, "MEMORY.md", "# App\n\n## Other\nnew\n")
+	rep2, err := MigrateLayout(r, idx, MigrateOptions{State: state})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rep2.Merged)+len(rep2.CopiedToMirror)+len(rep2.BackedUp) != 0 {
+	if n := len(rep2.Merged) + len(rep2.CopiedToMirror) + len(rep2.BackedUp); n != 0 {
 		t.Errorf("re-running migration should be a no-op; got %#v", rep2)
+	}
+	if s := readMem(t, r.Mirror, key, "MEMORY.md"); contains(s, "## Legacy") {
+		t.Errorf("deleted section resurrected: %q", s)
+	}
+
+	// An old-version PC edits the legacy file: that edit is imported.
+	writeMem(t, r.Mirror, "-home-matta-app", "MEMORY.md", "# App\n\n## Legacy\nold\n\n## FromOldPC\nx\n")
+	if _, err := MigrateLayout(r, idx, MigrateOptions{State: state}); err != nil {
+		t.Fatal(err)
+	}
+	if s := readMem(t, r.Mirror, key, "MEMORY.md"); !contains(s, "## FromOldPC") {
+		t.Errorf("edit to the legacy dir was not imported: %q", s)
+	}
+}
+
+// A legacy file whose content the key's file already held at some point (the
+// Prior check) is stale and must not be copied back after a delete or saved as
+// a collision backup.
+func TestMigrateLayout_SkipsPriorVersions(t *testing.T) {
+	r, root := reconcileFixture(t)
+	idx, key := fingerprintedProject(t, r, root, "-home-matta-app")
+	writeMem(t, r.Mirror, "-home-matta-app", "feedback_a.md", "v1")
+	writeMem(t, r.Mirror, "-home-matta-app", "feedback_b.md", "v1")
+	writeMem(t, r.Mirror, key, "feedback_a.md", "v2") // edited since import elsewhere
+	// feedback_b.md was deleted under the key since import.
+
+	prior := func(rel string, content []byte) bool { return string(content) == "v1" }
+	rep, err := MigrateLayout(r, idx, MigrateOptions{State: NewMigrationState(), Prior: prior})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(rep.Merged) + len(rep.CopiedToMirror) + len(rep.BackedUp); n != 0 {
+		t.Errorf("stale legacy versions should be skipped; got %#v", rep)
+	}
+	if memExists(t, r.Mirror, key, "feedback_b.md") {
+		t.Errorf("deleted file resurrected from a stale legacy copy")
+	}
+}
+
+func TestMigrateLayout_PruneRemovesOnlyImported(t *testing.T) {
+	r, root := reconcileFixture(t)
+	idx, key := fingerprintedProject(t, r, root, "-home-matta-app")
+	writeMem(t, r.Mirror, "-home-matta-app", "MEMORY.md", "# App\n")
+	extra := filepath.Join(r.Mirror, "-home-matta-app", "memory", "archive")
+	if err := os.MkdirAll(extra, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := MigrateLayout(r, idx, MigrateOptions{State: NewMigrationState(), Prune: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !memExists(t, r.Mirror, key, "MEMORY.md") {
+		t.Fatalf("file not imported before prune")
+	}
+	if memExists(t, r.Mirror, "-home-matta-app", "MEMORY.md") || len(rep.PrunedLegacy) != 1 {
+		t.Errorf("imported legacy file not pruned; rep %#v", rep)
+	}
+	if _, err := os.Stat(extra); err != nil {
+		t.Errorf("unmigrated subdir must survive pruning: %v", err)
+	}
+}
+
+// After migration, a legacy dir that reappears (pushed by a PC still on the old
+// version) must not be paired with the local project and written to — that
+// kept it alive as a second, diverging copy.
+func TestReconcile_DoesNotWriteLegacyDirOfFingerprintedProject(t *testing.T) {
+	r, root := reconcileFixture(t)
+	idx, key := fingerprintedProject(t, r, root, "-home-matta-app")
+	writeMem(t, r.Claude, "-home-matta-app", "MEMORY.md", "# App\n\n## Local\nx\n")
+	writeMem(t, r.Claude, "-home-matta-app", "feedback_a.md", "a")
+	writeMem(t, r.Mirror, "-home-matta-app", "MEMORY.md", "# App\n\n## OldPC\ny\n")
+
+	if _, err := Reconcile(r, idx, NewManifest()); err != nil {
+		t.Fatal(err)
+	}
+	if memExists(t, r.Mirror, "-home-matta-app", "feedback_a.md") {
+		t.Errorf("Reconcile wrote local files into the legacy dir")
+	}
+	if s := readMem(t, r.Mirror, "-home-matta-app", "MEMORY.md"); contains(s, "## Local") {
+		t.Errorf("Reconcile merged into the legacy dir: %q", s)
+	}
+	if !memExists(t, r.Mirror, key, "feedback_a.md") {
+		t.Errorf("local file missing under the fingerprint key")
+	}
+}
+
+// Two checkouts of one repo on this machine (e.g. worktrees) share a key. An
+// edit in one must reach the other, and a reconcile must leave them identical
+// and stable — not flip the mirror between them and pile up backups.
+func TestReconcile_SiblingCheckoutsConverge(t *testing.T) {
+	r, root := reconcileFixture(t)
+	repoA := filepath.Join(root, "a")
+	repoB := filepath.Join(root, "b")
+	makeRepo(t, repoA, "git@github.com:acme/app.git")
+	makeRepo(t, repoB, "git@github.com:acme/app.git")
+	makeClaudeProject(t, r.Claude, "-wt-a", repoA)
+	makeClaudeProject(t, r.Claude, "-wt-b", repoB)
+	writeMem(t, r.Claude, "-wt-a", "feedback_x.md", "new")
+	writeMem(t, r.Claude, "-wt-b", "feedback_x.md", "old")
+	idx, err := project.Build(r.Claude, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ea, _ := idx.Get("-wt-a")
+	key := ea.Key
+	writeMem(t, r.Mirror, key, "feedback_x.md", "old")
+
+	if _, err := Reconcile(r, idx, NewManifest()); err != nil {
+		t.Fatal(err)
+	}
+	a := readMem(t, r.Claude, "-wt-a", "feedback_x.md")
+	b := readMem(t, r.Claude, "-wt-b", "feedback_x.md")
+	m := readMem(t, r.Mirror, key, "feedback_x.md")
+	if a != b || b != m {
+		t.Fatalf("checkouts did not converge: a=%q b=%q mirror=%q", a, b, m)
+	}
+
+	// Stable: a second reconcile changes nothing.
+	rep, err := Reconcile(r, idx, NewManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(rep.CopiedToMirror) + len(rep.CopiedToClaude) + len(rep.BackedUp) + len(rep.Merged); n != 0 {
+		t.Errorf("second reconcile should be a no-op; got %#v", rep)
+	}
+
+	// Incremental path: an edit in A fans out to B via CopyToMirror.
+	writeMem(t, r.Claude, "-wt-a", "feedback_x.md", "newer")
+	if err := CopyToMirror(r, idx, "-wt-a", "feedback_x.md"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readMem(t, r.Claude, "-wt-b", "feedback_x.md"); got != "newer" {
+		t.Errorf("edit did not fan out to sibling checkout: %q", got)
+	}
+
+	// A delete in A (recorded in the manifest) removes it everywhere instead of
+	// being undone by B's copy.
+	manifest, err := BuildFromClaudeTree(r.Claude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(r.Claude, "-wt-a", "memory", "feedback_x.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reconcile(r, idx, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if memExists(t, r.Claude, "-wt-b", "feedback_x.md") || memExists(t, r.Mirror, key, "feedback_x.md") {
+		t.Errorf("delete in one checkout was undone by its sibling")
+	}
+}
+
+// RemoveFromMirror on an event for a file that is still present (atomic
+// replace) must not delete anything.
+func TestRemoveFromMirror_FileStillPresentIsCopied(t *testing.T) {
+	r, root := reconcileFixture(t)
+	idx, key := fingerprintedProject(t, r, root, "-p")
+	writeMem(t, r.Claude, "-p", "MEMORY.md", "# x\n")
+	if err := RemoveFromMirror(r, idx, "-p", "MEMORY.md"); err != nil {
+		t.Fatal(err)
+	}
+	if !memExists(t, r.Mirror, key, "MEMORY.md") {
+		t.Errorf("present file should have been copied, not removed")
 	}
 }

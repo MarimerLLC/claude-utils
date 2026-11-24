@@ -14,10 +14,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // maxJSONLLine bounds the scanner buffer. Transcript lines embed tool output and
@@ -73,18 +75,42 @@ func scanCwd(path string) (string, bool) {
 	return "", false
 }
 
-// newestJSONLFirst lists *.jsonl transcripts in dir ordered most-recently-
-// modified first, so the current checkout's path wins if a project has moved.
-func newestJSONLFirst(dir string) []string {
+// TranscriptStamp summarizes a project dir's transcripts (newest file name,
+// its modification time, and the transcript count). When it is unchanged since
+// the last index build, the project's resolved path — and so its key — can't
+// have changed either, which lets Build skip the git calls. Empty when the dir
+// has no transcripts.
+func TranscriptStamp(dir string) string {
+	items := listJSONL(dir)
+	if len(items) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s@%d#%d", filepath.Base(items[0].path), items[0].mod, len(items))
+}
+
+// transcriptRecentlyWritten reports whether dir's newest transcript was
+// modified within window — i.e. Claude may still be writing its first lines, so
+// a missing cwd is not yet evidence that the project is unresolvable. A dir
+// with no transcripts at all (e.g. one materialized from the mirror) is not
+// "pending": nothing will ever give it a cwd.
+func transcriptRecentlyWritten(dir string, window time.Duration) bool {
+	items := listJSONL(dir)
+	return len(items) > 0 && items[0].mod >= time.Now().Add(-window).UnixNano()
+}
+
+type jsonlItem struct {
+	path string
+	mod  int64
+}
+
+// listJSONL lists *.jsonl transcripts in dir ordered most-recently-modified
+// first (ties broken by name, for a deterministic stamp).
+func listJSONL(dir string) []jsonlItem {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
-	type item struct {
-		path string
-		mod  int64
-	}
-	var items []item
+	var items []jsonlItem
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
@@ -93,9 +119,21 @@ func newestJSONLFirst(dir string) []string {
 		if err != nil {
 			continue
 		}
-		items = append(items, item{filepath.Join(dir, e.Name()), info.ModTime().UnixNano()})
+		items = append(items, jsonlItem{filepath.Join(dir, e.Name()), info.ModTime().UnixNano()})
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].mod > items[j].mod })
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].mod != items[j].mod {
+			return items[i].mod > items[j].mod
+		}
+		return items[i].path < items[j].path
+	})
+	return items
+}
+
+// newestJSONLFirst lists *.jsonl transcripts in dir ordered most-recently-
+// modified first, so the current checkout's path wins if a project has moved.
+func newestJSONLFirst(dir string) []string {
+	items := listJSONL(dir)
 	paths := make([]string, len(items))
 	for i, it := range items {
 		paths[i] = it.path

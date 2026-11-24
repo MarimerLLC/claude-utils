@@ -28,10 +28,18 @@ type Loop struct {
 	Hostname string
 	OnFlush  func(localChanges bool, err error) // optional, for tests/observability
 
-	// idx maps localHash → fingerprint key for the current Claude tree. Rebuilt
-	// at startup and on the pull tick; filled lazily for projects that appear
-	// mid-session. The loop is single-goroutine, so no locking is needed.
+	// idx maps localHash → fingerprint key for the current Claude tree. Seeded
+	// from the saved index at startup, rebuilt then and on the pull tick, and
+	// filled lazily for projects that appear mid-session. The loop is
+	// single-goroutine, so no locking is needed.
 	idx *project.Index
+
+	// migState records legacy mirror files already imported (see MigrateLayout).
+	migState *MigrationState
+
+	// needReconcile is set when a watcher event hit a project that couldn't be
+	// keyed yet; the next debounced flush reconciles before committing.
+	needReconcile bool
 }
 
 // Run blocks until ctx is canceled. Returns the first fatal error or nil
@@ -84,15 +92,23 @@ func (l *Loop) Run(ctx context.Context) error {
 
 	pendingLocal := false
 
-	// Build the project index and migrate any legacy path-keyed mirror dirs to
-	// fingerprint keys before the first sync, so pre-existing per-machine dirs
-	// collapse to one key (and merge via the driver on the next push/pull).
-	l.rebuildIndex(roots)
-	if rep, err := MigrateLayout(roots, l.idx); err != nil {
-		log.Println("migrate layout:", err)
-	} else if n := len(rep.CopiedToMirror) + len(rep.Merged) + len(rep.BackedUp); n > 0 {
-		log.Printf("migrated legacy mirror dirs to fingerprint keys (%d files)", n)
+	// Build the project index (seeded from the saved one, so keys stay stable
+	// for projects whose checkout has since gone away) and import any legacy
+	// path-keyed mirror dirs into fingerprint keys before the first sync, so
+	// pre-existing per-machine dirs collapse to one key.
+	if saved, err := project.Load(l.Cfg.SyncDir); err != nil {
+		log.Println("load project index (rebuilding from scratch):", err)
+	} else {
+		l.idx = saved
 	}
+	if st, err := LoadMigrationState(l.Cfg.SyncDir); err != nil {
+		log.Println("load migration state (re-importing legacy dirs):", err)
+		l.migState = NewMigrationState()
+	} else {
+		l.migState = st
+	}
+	l.rebuildIndex(roots)
+	l.migrate(repo, roots)
 
 	// Initial sync at startup: reconcile local with mirror (using manifest
 	// to detect deletes that happened while the daemon was off), then flush.
@@ -143,6 +159,20 @@ func (l *Loop) Run(ctx context.Context) error {
 			log.Println("watcher error:", err)
 
 		case <-debounce.C:
+			if l.needReconcile {
+				// An event hit a project with no key yet; resolve what we can and
+				// reconcile so its change isn't left waiting for the pull tick.
+				l.needReconcile = false
+				l.rebuildIndex(roots)
+				m, err := LoadManifest(l.Cfg.SyncDir)
+				if err != nil {
+					log.Println("load manifest:", err)
+					m = NewManifest()
+				}
+				if _, err := Reconcile(roots, l.idx, m); err != nil {
+					log.Println("reconcile:", err)
+				}
+			}
 			err := l.flush(repo, roots, true)
 			if err != nil {
 				log.Println("flush (local):", err)
@@ -171,8 +201,10 @@ func (l *Loop) Run(ctx context.Context) error {
 				m = NewManifest()
 			}
 			// Refresh the index so projects opened since startup (and any repo
-			// whose remote changed) resolve to the right key before reconciling.
+			// whose remote changed) resolve to the right key, and import edits
+			// pre-upgrade PCs made to legacy dirs, before reconciling.
 			l.rebuildIndex(roots)
+			l.migrate(repo, roots)
 			if _, err := Reconcile(roots, l.idx, m); err != nil {
 				log.Println("reconcile:", err)
 			}
@@ -218,24 +250,33 @@ func (l *Loop) handleEvent(watcher *fsnotify.Watcher, roots Roots, ev fsnotify.E
 		return false, nil
 	}
 
+	var opErr error
+	var op string
 	switch {
 	case ev.Op&(fsnotify.Create|fsnotify.Write) != 0:
-		if err := CopyToMirror(roots, l.idx, hash, name); err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				// Race: file vanished between event and read. Treat as remove.
-				return true, RemoveFromMirror(roots, l.idx, hash, name)
-			}
-			return false, fmt.Errorf("copy to mirror %s/%s: %w", hash, name, err)
+		op = "copy to mirror"
+		opErr = CopyToMirror(roots, l.idx, hash, name)
+		if errors.Is(opErr, fs.ErrNotExist) {
+			// Race: file vanished between event and read. Treat as remove.
+			op = "remove from mirror"
+			opErr = RemoveFromMirror(roots, l.idx, hash, name)
 		}
-		return true, nil
-
 	case ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0:
-		if err := RemoveFromMirror(roots, l.idx, hash, name); err != nil {
-			return false, fmt.Errorf("remove from mirror %s/%s: %w", hash, name, err)
-		}
+		op = "remove from mirror"
+		opErr = RemoveFromMirror(roots, l.idx, hash, name)
+	default:
+		return false, nil
+	}
+	if errors.Is(opErr, ErrProjectPending) {
+		// Not keyable yet (Claude hasn't recorded the project's cwd). Don't
+		// guess a key; reconcile on the debounced flush instead.
+		l.needReconcile = true
 		return true, nil
 	}
-	return false, nil
+	if opErr != nil {
+		return false, fmt.Errorf("%s %s/%s: %w", op, hash, name, opErr)
+	}
+	return true, nil
 }
 
 // flush stages local changes, optionally commits, pulls remote work, propagates
@@ -264,6 +305,16 @@ func (l *Loop) flush(repo *gitwt.Repo, roots Roots, includeLocal bool) error {
 	if err := repo.Pull(l.Branch); err != nil {
 		// Don't propagate first-time failure (no upstream yet); push will create it.
 		log.Println("pull:", err)
+		// A conflict the merge driver can't resolve (modify/delete, a non-
+		// MEMORY.md overlap) leaves the work-tree mid-rebase, which would wedge
+		// every later sync. Back out; the local commits stay and are retried.
+		if repo.RebaseInProgress() {
+			if aerr := repo.AbortRebase(); aerr != nil {
+				log.Println("abort stuck rebase:", aerr)
+			} else {
+				log.Println("aborted conflicting rebase; will retry on the next sync")
+			}
+		}
 	}
 	postRev, _ := repo.Run("rev-parse", "HEAD")
 	if strings.TrimSpace(preRev) != strings.TrimSpace(postRev) && strings.TrimSpace(preRev) != "" {
@@ -329,7 +380,7 @@ func propagateChanges(repo *gitwt.Repo, roots Roots, idx *project.Index, pre, po
 			oldPath := fields[1]
 			path = fields[2]
 			if key, name, ok := splitMirrorPath(oldPath); ok {
-				removeFromClaude(roots, idx, key, name)
+				applied += removeFromClaude(roots, idx, key, name)
 			}
 		} else {
 			path = fields[1]
@@ -340,13 +391,14 @@ func propagateChanges(repo *gitwt.Repo, roots Roots, idx *project.Index, pre, po
 		}
 		switch {
 		case strings.HasPrefix(status, "D"):
-			removeFromClaude(roots, idx, key, name)
-			applied++
+			applied += removeFromClaude(roots, idx, key, name)
 		default:
-			if err := CopyToClaude(roots, idx, key, name); err != nil {
+			// A key with no local project (opened only on another PC, or a
+			// legacy dir MigrateLayout imports) targets nothing and isn't counted.
+			if n, err := CopyToClaude(roots, idx, key, name); err != nil {
 				log.Printf("propagate %s: %v", path, err)
 			} else {
-				applied++
+				applied += n
 			}
 		}
 	}
@@ -356,11 +408,14 @@ func propagateChanges(repo *gitwt.Repo, roots Roots, idx *project.Index, pre, po
 	return nil
 }
 
-// removeFromClaude deletes a memory file from every local project mapping to key.
-func removeFromClaude(roots Roots, idx *project.Index, key, name string) {
-	for _, localHash := range idx.LocalsFor(key) {
+// removeFromClaude deletes a memory file from every local project mapping to
+// key, returning how many local projects it targeted.
+func removeFromClaude(roots Roots, idx *project.Index, key, name string) int {
+	locals := idx.LocalsFor(key)
+	for _, localHash := range locals {
 		_ = os.Remove(filepath.Join(roots.Claude, localHash, "memory", name))
 	}
+	return len(locals)
 }
 
 // splitMirrorPath converts a path of the form "projects/<key>/memory/<file>"
@@ -395,11 +450,35 @@ func refreshMemoryWatches(w *fsnotify.Watcher, claudeRoot string) error {
 	return nil
 }
 
+// migrate imports legacy path-keyed mirror dirs into fingerprint keys (pruning
+// them only when configured) and saves the import record. Best-effort.
+func (l *Loop) migrate(repo *gitwt.Repo, roots Roots) {
+	rep, err := MigrateLayout(roots, l.idx, MigrateOptions{
+		State: l.migState,
+		Prior: PriorVersionIn(repo),
+		Prune: l.Cfg.PruneLegacyDirs,
+	})
+	if err != nil {
+		log.Println("migrate layout:", err)
+	}
+	if n := len(rep.CopiedToMirror) + len(rep.Merged) + len(rep.BackedUp); n > 0 {
+		log.Printf("imported legacy mirror dirs into fingerprint keys (%d files)", n)
+	}
+	if n := len(rep.PrunedLegacy); n > 0 {
+		log.Printf("pruned %d legacy mirror file(s)", n)
+	}
+	if err := l.migState.Save(l.Cfg.SyncDir); err != nil {
+		log.Println("save migration state:", err)
+	}
+}
+
 // rebuildIndex refreshes the localHash → fingerprint-key mapping from the
-// current Claude tree and persists it for observability. Best-effort: on error
-// it keeps any existing index (or an empty one) so the loop can proceed.
+// current Claude tree and persists it. The previous index seeds the build so
+// unchanged projects skip the git calls and vanished checkouts keep their key.
+// Best-effort: on error it keeps any existing index (or an empty one) so the
+// loop can proceed.
 func (l *Loop) rebuildIndex(roots Roots) {
-	idx, err := project.Build(roots.Claude)
+	idx, err := project.Build(roots.Claude, l.idx)
 	if err != nil {
 		log.Println("build project index:", err)
 		if l.idx == nil {

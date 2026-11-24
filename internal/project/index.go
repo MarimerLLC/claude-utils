@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 )
 
 // Index maps each local Claude project directory name (localHash) to the
@@ -21,7 +22,8 @@ type Index struct {
 type Entry struct {
 	Key    string `json:"key"`
 	Method Method `json:"method"`
-	Path   string `json:"path,omitempty"` // resolved real path, for diagnostics
+	Path   string `json:"path,omitempty"`  // resolved real path, for diagnostics
+	Stamp  string `json:"stamp,omitempty"` // TranscriptStamp when last resolved
 }
 
 type indexJSON struct {
@@ -32,7 +34,14 @@ type indexJSON struct {
 const (
 	indexStateDir = ".state"
 	indexFileName = "index.json"
-	indexVersion  = 1
+	// indexVersion 2 folds the in-repo subdirectory into keys; a version-1
+	// file's keys are not comparable, so Load ignores it.
+	indexVersion = 2
+
+	// pendingWindow is how long after a project's newest transcript was written
+	// we keep waiting for Claude to record a cwd in it before giving up and using
+	// the path key.
+	pendingWindow = 10 * time.Minute
 )
 
 // NewIndex returns an empty index.
@@ -46,7 +55,19 @@ func IndexPath(syncDir string) string {
 // Build scans claudeProjectsDir and resolves every project directory to its key.
 // Directories whose real path can't be resolved, or that aren't git repos, fall
 // back to the path key (their own name).
-func Build(claudeProjectsDir string) (*Index, error) {
+//
+// prev (may be nil) is the previous index — the in-memory one, or the one saved
+// on disk. It keeps keys stable and rebuilds cheap:
+//   - a project whose transcripts haven't changed keeps its entry without
+//     re-running git;
+//   - a project that was fingerprinted before but whose checkout is now gone
+//     (removed worktree, unmounted drive, transcripts aged out) keeps its last
+//     key instead of re-keying to the path.
+//
+// A freshly created project whose transcript doesn't carry a cwd yet is left
+// out entirely (it is picked up on a later build) rather than being pinned to
+// the path key.
+func Build(claudeProjectsDir string, prev *Index) (*Index, error) {
 	idx := NewIndex()
 	entries, err := os.ReadDir(claudeProjectsDir)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -56,29 +77,82 @@ func Build(claudeProjectsDir string) (*Index, error) {
 		return nil, err
 	}
 	for _, e := range entries {
-		if !e.IsDir() {
+		// A dir named like a fingerprint key is not a Claude project: older
+		// daemon versions materialized mirror dirs verbatim, so a pre-upgrade PC
+		// may hold ~/.claude/projects/g-<hash> copies. Never treat them as
+		// projects (they would join the real project's key as a phantom sibling).
+		if !e.IsDir() || IsFingerprintKey(e.Name()) {
 			continue
 		}
-		localHash := e.Name()
-		realPath, _ := ResolvePath(filepath.Join(claudeProjectsDir, localHash))
-		key, method := Fingerprint(realPath, localHash)
-		idx.byLocal[localHash] = Entry{Key: key, Method: method, Path: realPath}
+		entry, pending := resolveEntry(claudeProjectsDir, e.Name(), prev)
+		if pending {
+			continue
+		}
+		idx.byLocal[e.Name()] = entry
 	}
 	return idx, nil
 }
 
+// resolveEntry computes one project's entry. pending reports a project that
+// can't be keyed yet and must not be cached.
+func resolveEntry(claudeProjectsDir, localHash string, prev *Index) (entry Entry, pending bool) {
+	dir := filepath.Join(claudeProjectsDir, localHash)
+	stamp := TranscriptStamp(dir)
+	var old Entry
+	hadOld := false
+	if prev != nil {
+		old, hadOld = prev.byLocal[localHash]
+	}
+	if hadOld && stamp != "" && old.Stamp == stamp {
+		return old, false // nothing Claude records about this project changed
+	}
+
+	realPath, resolved := ResolvePath(dir)
+	key, method := Fingerprint(realPath, localHash)
+	if method == MethodPath && hadOld && old.Method != MethodPath && !isDir(realPath) {
+		// The checkout this project was fingerprinted from is gone or
+		// unreachable. Re-keying to the path would republish its memories under
+		// a second, per-machine mirror dir, so keep the last known key.
+		old.Stamp = stamp
+		return old, false
+	}
+	if !resolved && transcriptRecentlyWritten(dir, pendingWindow) {
+		return Entry{}, true // Claude may not have written the cwd yet
+	}
+	return Entry{Key: key, Method: method, Path: realPath, Stamp: stamp}, false
+}
+
+func isDir(p string) bool {
+	if p == "" {
+		return false
+	}
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
+}
+
 // KeyFor returns the mirror key for a local project directory, computing and
 // caching it on a miss (so the daemon's incremental path doesn't need a full
-// rebuild when a new project appears mid-session).
-func (idx *Index) KeyFor(claudeProjectsDir, localHash string) string {
+// rebuild when a new project appears mid-session). ok is false when the
+// project can't be keyed yet (see Build); nothing is cached then, so the next
+// call tries again.
+func (idx *Index) KeyFor(claudeProjectsDir, localHash string) (key string, ok bool) {
 	if e, ok := idx.byLocal[localHash]; ok {
-		return e.Key
+		return e.Key, true
 	}
-	realPath, _ := ResolvePath(filepath.Join(claudeProjectsDir, localHash))
-	key, method := Fingerprint(realPath, localHash)
-	idx.byLocal[localHash] = Entry{Key: key, Method: method, Path: realPath}
-	return key
+	if IsFingerprintKey(localHash) {
+		return "", false
+	}
+	e, pending := resolveEntry(claudeProjectsDir, localHash, nil)
+	if pending {
+		return "", false
+	}
+	idx.byLocal[localHash] = e
+	return e.Key, true
 }
+
+// Set records an entry directly. Reconcile uses it for path-keyed projects it
+// materializes from the mirror, so later events for them resolve from cache.
+func (idx *Index) Set(localHash string, e Entry) { idx.byLocal[localHash] = e }
 
 // LocalsFor returns the local project directories that map to key. Usually one,
 // but a repo checked out at two paths on the same machine yields several — all of
@@ -124,6 +198,9 @@ func Load(syncDir string) (*Index, error) {
 		return nil, err
 	}
 	idx := NewIndex()
+	if raw.Version != indexVersion {
+		return idx, nil // keys from another scheme; rebuild from scratch
+	}
 	for lh, e := range raw.Entries {
 		idx.byLocal[lh] = e
 	}

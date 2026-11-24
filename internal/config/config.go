@@ -40,6 +40,12 @@ type Config struct {
 
 	// PullIntervalSec is how often to pull from the remote when idle.
 	PullIntervalSec int `json:"pullIntervalSec"`
+
+	// PruneLegacyDirs deletes legacy path-keyed mirror dirs once their files
+	// are imported into fingerprint keys. Leave it off until every PC syncing
+	// the repo runs a fingerprint-aware version: an older daemon treats the
+	// deletion as the user deleting those memories and removes its local copies.
+	PruneLegacyDirs bool `json:"pruneLegacyDirs,omitempty"`
 }
 
 // Defaults returns a Config populated with platform-appropriate defaults.

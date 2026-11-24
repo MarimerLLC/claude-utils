@@ -166,9 +166,24 @@ records in its session transcripts) and derives a machine-independent **key**:
 - the dash-encoded path itself — fallback for non-git directories (unchanged
   behavior; only merges across PCs with identical paths).
 
+A project opened in a **subdirectory** of a repo (Claude keeps a separate
+project per directory) gets its own key: the path relative to the repo root is
+folded into the hash, so `repo/docs` doesn't share memories with `repo`, and a
+plain folder that only sits inside some enclosing repo (a dotfiles-managed
+home, say) doesn't take on that repo's identity.
+
+Several local projects can map to one key — the same repo checked out twice on
+one machine, e.g. as **git worktrees**. They share one memory set: an edit in
+one checkout is copied to the others straight away, and reconcile keeps them
+identical.
+
 A per-PC index at `~/.claudesync/.state/index.json` (gitignored) records the
-`localHash → key` mapping for observability and to route inbound changes back to
-the right local directory.
+`localHash → key` mapping. It routes inbound changes back to the right local
+directories and keeps keys stable: a project whose checkout has since gone away
+(removed worktree, unmounted drive, transcripts cleaned up by Claude) keeps its
+last key rather than falling back to the path key. Projects whose transcripts
+haven't changed since the last pass are not re-fingerprinted, so the periodic
+rebuild stays cheap.
 
 **Lazy materialization.** A project synced from another PC but never opened on
 this one stays pending in the mirror — there's no local path to write it to yet.
@@ -203,6 +218,7 @@ commits.
 - `~/.claudesync/config.json` — per-PC (paths embed your machine layout)
 - `~/.claudesync/.state/manifest.json` — per-PC (delete-detection state)
 - `~/.claudesync/.state/index.json` — per-PC (localHash → fingerprint key map)
+- `~/.claudesync/.state/migrated.json` — per-PC (legacy files already imported)
 - `~/.claudesync/daemon.pid` — runtime state
 - `~/.claudesync/distilled/DISTILLED.md` — derived index, regenerated per-PC
   (the distilled `<slug>.md` entry files themselves **are** synced)
@@ -245,6 +261,7 @@ This means:
     ├── .gitignore                        # excludes config.json, .state/, etc.
     ├── .state/manifest.json              # per-PC delete-detection state
     ├── .state/index.json                 # per-PC localHash → fingerprint key map
+    ├── .state/migrated.json              # per-PC record of imported legacy files
     ├── distilled/                        # shared distilled-memory catalog
     │   ├── DISTILLED.md                  # derived index (gitignored)
     │   └── <slug>.md ...                 # distilled entries (synced)
@@ -279,14 +296,28 @@ If that works without prompting, the daemon will too.
   paths on different PCs still merges. A non-git directory falls back to a
   path-based key, so it only merges across PCs that use the identical absolute
   path.
-- **Upgrading from a path-keyed layout**: the first daemon run after upgrading
-  migrates existing mirror directories to fingerprint keys, merging any that
-  collapse to the same key. Both PCs must be upgraded for a project's previously
-  divergent histories to converge on the shared key.
+- **Upgrading from a path-keyed layout**: an upgraded daemon imports the existing
+  path-keyed mirror directories into their fingerprint keys, merging any that
+  collapse to the same key, and keeps importing edits that not-yet-upgraded PCs
+  make to them (on every pull tick). It **leaves the legacy directories in
+  place**: a PC still running the old version would read their deletion as you
+  deleting those memories and remove its local copies. Upgrade PCs in any order;
+  until a PC is upgraded it keeps syncing through the legacy directories and
+  doesn't see changes other PCs make under the new keys. An old-version PC also
+  copies the new `g-…`/`r-…` mirror dirs into its `~/.claude/projects/` as
+  stray folders; they do no harm, are ignored after upgrading, and can be
+  deleted.
+- **Pruning legacy directories**: once **every** PC syncing the repo runs a
+  fingerprint-aware version, set `"pruneLegacyDirs": true` in
+  `~/.claudesync/config.json` and restart the daemon. It deletes each legacy
+  file after importing it (and the directory once empty) and pushes the
+  deletions; other upgraded PCs ignore them. A PC only prunes the legacy
+  directories of its own project paths, so if your PCs use different paths, set
+  it on each of them.
 - **Fingerprint edge cases**: a shallow clone (`git clone --depth 1`) has no true
   root commit, so a remote-less shallow repo falls back to the path key. A repo
-  whose `origin` URL is later changed (renamed org, new host) re-keys and will
-  re-merge under the new key.
+  whose `origin` URL is later changed (renamed org, new host) re-keys — the next
+  time that project is used — and re-merges under the new key.
 - **No live conflict UI**: when the merge driver emits actual conflict markers
   (rare; only on overlapping line edits within the same `MEMORY.md` section
   body), the file is committed and pushed with markers. The next time you edit on
