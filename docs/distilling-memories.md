@@ -78,9 +78,14 @@ You only do this once per machine.
    ```jsonc
    { "permissions": { "allow": [
      "Read(~/.claudesync/distilled/**)",
-     "Write(~/.claudesync/distilled/**)"
+     "Edit(~/.claudesync/distilled/**)"
    ] } }
    ```
+
+   Use `Edit(...)`, not `Write(...)`, for the write side: Claude Code matches
+   file permission checks against `Edit` rules only (they cover every
+   file-editing tool, including `Write`), and warns at startup about a
+   `Write(path)` allow rule.
 
    Without this, the skills still work but Claude will ask permission each time
    it reads or writes the catalog (expected in default, non-bypass mode).
@@ -174,6 +179,10 @@ to know what belongs.
 
 - **Claude keeps asking permission to read/write the catalog.** The allow-rule
   in setup step 3 isn't in place. Add it to `~/.claude/settings.json`.
+- **Claude warns at startup that a `Write(...)` allow rule "is not matched by
+  file permission checks".** An older setup used `Write(...)` for the catalog.
+  Replace it with `Edit(...)` (see setup step 3); the warning goes away and the
+  rule starts actually applying.
 - **`/distill` promoted something too project-specific.** Tell Claude to remove
   that entry from `~/.claudesync/distilled/` and un-tag the original; or delete
   the `<slug>.md` and run `claude-memsync distill --prune`.
