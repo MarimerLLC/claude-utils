@@ -11,6 +11,7 @@ import (
 
 	"github.com/MarimerLLC/claude-utils/internal/config"
 	"github.com/MarimerLLC/claude-utils/internal/gitwt"
+	"github.com/MarimerLLC/claude-utils/internal/project"
 	syncpkg "github.com/MarimerLLC/claude-utils/internal/sync"
 )
 
@@ -130,14 +131,47 @@ func bootstrap(cfg config.Config, force bool) error {
 		return err
 	}
 	roots := syncpkg.Roots{Claude: cfg.ClaudeProjectsDir, Mirror: mirrorProjects}
+
+	// Build the fingerprint index and import any legacy path-keyed dirs the
+	// remote already carries (from a pre-fingerprint version or another machine)
+	// into their fingerprint keys before reconciling local memories in. Legacy
+	// dirs are kept (see MigrateLayout) unless pruneLegacyDirs is set.
+	prevIdx, err := project.Load(cfg.SyncDir)
+	if err != nil {
+		prevIdx = nil // unreadable saved index: rebuild from scratch
+	}
+	idx, err := project.Build(cfg.ClaudeProjectsDir, prevIdx)
+	if err != nil {
+		return fmt.Errorf("build project index: %w", err)
+	}
+	migState, err := syncpkg.LoadMigrationState(cfg.SyncDir)
+	if err != nil {
+		migState = syncpkg.NewMigrationState()
+	}
+	migRep, err := syncpkg.MigrateLayout(roots, idx, syncpkg.MigrateOptions{
+		State: migState,
+		Prior: syncpkg.PriorVersionIn(repo),
+		Prune: cfg.PruneLegacyDirs,
+	})
+	if err != nil {
+		return fmt.Errorf("migrate layout: %w", err)
+	}
+	printReport(migRep)
+	if err := migState.Save(cfg.SyncDir); err != nil {
+		fmt.Fprintln(os.Stderr, "save migration state:", err)
+	}
+
 	// First-time init: no manifest yet. Pass nil so Reconcile doesn't try
 	// to propagate deletes (with no prior state, "missing in Claude" can't
 	// be distinguished from "this PC never had it").
-	report, err := syncpkg.Reconcile(roots, nil)
+	report, err := syncpkg.Reconcile(roots, idx, nil)
 	if err != nil {
 		return fmt.Errorf("reconcile: %w", err)
 	}
 	printReport(report)
+	if err := idx.Save(cfg.SyncDir); err != nil {
+		fmt.Fprintln(os.Stderr, "save project index:", err)
+	}
 
 	// Step 6: stage + commit + push.
 	if err := repo.AddAll(); err != nil {
@@ -257,5 +291,14 @@ func printReport(r syncpkg.SyncReport) {
 	}
 	if len(r.BackedUp) > 0 {
 		fmt.Fprintf(os.Stderr, "%d collisions saved as .from-remote-* in the mirror\n", len(r.BackedUp))
+	}
+	if len(r.RemovedFromMirror) > 0 {
+		fmt.Fprintf(os.Stderr, "removed %d deleted files from the mirror\n", len(r.RemovedFromMirror))
+	}
+	if len(r.RemovedFromClaude) > 0 {
+		fmt.Fprintf(os.Stderr, "removed %d deleted files from other local checkouts\n", len(r.RemovedFromClaude))
+	}
+	if len(r.PrunedLegacy) > 0 {
+		fmt.Fprintf(os.Stderr, "pruned %d legacy path-keyed mirror files\n", len(r.PrunedLegacy))
 	}
 }

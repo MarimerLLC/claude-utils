@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/MarimerLLC/claude-utils/internal/proc"
@@ -119,6 +121,35 @@ func (r *Repo) Commit(message string) (bool, error) {
 // Pull does `git pull --rebase --autostash origin <branch>`.
 func (r *Repo) Pull(branch string) error {
 	_, err := r.Run("pull", "--rebase", "--autostash", "origin", branch)
+	return err
+}
+
+// RebaseInProgress reports whether the work-tree is stopped mid-rebase (e.g. a
+// `pull --rebase` that hit a conflict the merge driver couldn't resolve).
+func (r *Repo) RebaseInProgress() bool {
+	for _, d := range []string{"rebase-merge", "rebase-apply"} {
+		out, err := r.Run("rev-parse", "--git-path", d)
+		if err != nil {
+			continue
+		}
+		p := strings.TrimSpace(out)
+		if p == "" {
+			continue
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(r.Dir, p)
+		}
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// AbortRebase runs `git rebase --abort`, restoring the pre-pull state (and any
+// autostashed changes) so later syncs aren't stuck behind a half-done rebase.
+func (r *Repo) AbortRebase() error {
+	_, err := r.Run("rebase", "--abort")
 	return err
 }
 
