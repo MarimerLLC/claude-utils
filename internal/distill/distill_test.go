@@ -242,6 +242,65 @@ func TestReconcileSkipsEntriesFromProjectsNotOnThisMachine(t *testing.T) {
 	}
 }
 
+// A source that exists but can't be read is uncertain, not stale, and is
+// counted apart from entries whose origin project is absent.
+func TestReconcileKeepsUnreadableSources(t *testing.T) {
+	dir := t.TempDir()
+	projects := filepath.Join(dir, "projects")
+	distilled := filepath.Join(dir, "distilled")
+
+	// A directory where the source file should be: ReadFile fails, but not
+	// with ErrNotExist.
+	if err := os.MkdirAll(filepath.Join(projects, "P1", "memory", "odd.md"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(distilled, "odd.md"), catalogEntry("odd", "d", "feedback", "P1", "odd.md", "x"))
+
+	res, err := Reconcile(Options{DistilledDir: distilled, ProjectsDir: projects})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Pruned != 0 || res.Skipped != 0 || res.Unread != 1 {
+		t.Errorf("Pruned/Skipped/Unread = %d/%d/%d, want 0/0/1", res.Pruned, res.Skipped, res.Unread)
+	}
+	if _, err := os.Stat(filepath.Join(distilled, "odd.md")); err != nil {
+		t.Errorf("entry with an unreadable source must survive: %v", err)
+	}
+}
+
+// `distill --dry-run --prune` reports what a prune would do without removing
+// anything, and leaves would-be-pruned entries out of the index count.
+func TestPreviewWithPruneTouchesNothing(t *testing.T) {
+	dir := t.TempDir()
+	projects := filepath.Join(dir, "projects")
+	distilled := filepath.Join(dir, "distilled")
+
+	writeFile(t, filepath.Join(projects, "P1", "memory", "live.md"), sourceMemory("live", true, "x"))
+	writeFile(t, filepath.Join(distilled, "live.md"), catalogEntry("live", "d", "feedback", "P1", "live.md", "x"))
+	writeFile(t, filepath.Join(projects, "P1", "memory", "untagged.md"), sourceMemory("untagged", false, "y"))
+	writeFile(t, filepath.Join(distilled, "untagged.md"), catalogEntry("untagged", "d", "feedback", "P1", "untagged.md", "y"))
+	writeFile(t, filepath.Join(distilled, "from-pc2.md"), catalogEntry("from-pc2", "d", "feedback", "P2", "remote.md", "z"))
+
+	res, err := Preview(Options{DistilledDir: distilled, ProjectsDir: projects}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Pruned != 1 || res.Skipped != 1 {
+		t.Errorf("Pruned/Skipped = %d/%d, want 1/1", res.Pruned, res.Skipped)
+	}
+	if res.Indexed != 2 {
+		t.Errorf("Indexed = %d, want 2 (would-be-pruned entry excluded)", res.Indexed)
+	}
+	for _, f := range []string{"live.md", "untagged.md", "from-pc2.md"} {
+		if _, err := os.Stat(filepath.Join(distilled, f)); err != nil {
+			t.Errorf("dry run must not remove %s: %v", f, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(distilled, IndexFileName)); !os.IsNotExist(err) {
+		t.Errorf("dry run must not write %s", IndexFileName)
+	}
+}
+
 func TestReconcileNeverPrunesBlindWhenSourcesInvisible(t *testing.T) {
 	dir := t.TempDir()
 	distilled := filepath.Join(dir, "distilled")

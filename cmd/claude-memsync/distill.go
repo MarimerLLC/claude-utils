@@ -37,7 +37,7 @@ func runDistill(args []string) int {
 
 	var res distill.Result
 	if *dryRun {
-		res, err = distill.Preview(opts)
+		res, err = distill.Preview(opts, *prune)
 	} else {
 		res, err = distill.Run(opts, *prune)
 	}
@@ -69,12 +69,24 @@ func report(res distill.Result, dryRun bool) {
 		verb = "would index"
 	}
 	fmt.Printf("%s %d distilled %s\n", verb, res.Indexed, plural(res.Indexed, "entry", "entries"))
+	keep := "kept"
+	if dryRun {
+		keep = "would keep"
+	}
 	if res.Pruned > 0 {
-		fmt.Printf("pruned %d stale %s\n", res.Pruned, plural(res.Pruned, "entry", "entries"))
+		pruneVerb := "pruned"
+		if dryRun {
+			pruneVerb = "would prune"
+		}
+		fmt.Printf("%s %d stale %s\n", pruneVerb, res.Pruned, plural(res.Pruned, "entry", "entries"))
 	}
 	if res.Skipped > 0 {
-		fmt.Printf("kept %d %s whose origin project isn't on this machine (can't judge from here)\n",
-			res.Skipped, plural(res.Skipped, "entry", "entries"))
+		fmt.Printf("%s %d %s whose origin project folder isn't on this machine (can't judge from here)\n",
+			keep, res.Skipped, plural(res.Skipped, "entry", "entries"))
+	}
+	if res.Unread > 0 {
+		fmt.Printf("%s %d %s whose source couldn't be read (left alone; try again)\n",
+			keep, res.Unread, plural(res.Unread, "entry", "entries"))
 	}
 	if len(res.Pending) > 0 {
 		fmt.Printf("\n%d marked %s awaiting distillation (run /distill to generalize):\n",

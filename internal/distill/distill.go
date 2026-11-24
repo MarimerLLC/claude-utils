@@ -94,8 +94,9 @@ type Conflict struct {
 // Result summarizes a distill run.
 type Result struct {
 	Indexed   int        // catalog entries written to the index
-	Pruned    int        // stale catalog entries removed (Reconcile)
-	Skipped   int        // entries left alone because their origin project isn't on this machine
+	Pruned    int        // stale catalog entries removed (Reconcile); in Preview, would be removed
+	Skipped   int        // entries left alone: their origin project folder isn't on this machine
+	Unread    int        // entries left alone: their source couldn't be checked (I/O error)
 	Pending   []Origin   // marked source memories with no catalog entry yet
 	Conflicts []Conflict // same name, divergent content across sources
 }
@@ -104,32 +105,47 @@ type Result struct {
 // entry point used by `claude-memsync distill`.
 func Run(opts Options, prune bool) (Result, error) {
 	opts.applyDefaults()
-	var pruned, skipped int
+	var r Result
 	if prune {
-		r, err := Reconcile(opts)
+		var err error
+		r, err = Reconcile(opts)
 		if err != nil {
 			return Result{}, err
 		}
-		pruned, skipped = r.Pruned, r.Skipped
 	}
 	res, err := BuildIndex(opts)
 	if err != nil {
 		return res, err
 	}
-	res.Pruned, res.Skipped = pruned, skipped
+	res.Pruned, res.Skipped, res.Unread = r.Pruned, r.Skipped, r.Unread
 	return res, nil
 }
 
-// Preview reports what BuildIndex would record (entry count, worklist,
-// conflicts) without writing the index or touching any files. Used by
-// `claude-memsync distill --dry-run`.
-func Preview(opts Options) (Result, error) {
+// Preview reports what Run would record (entry count, worklist, conflicts and,
+// when prune is set, what Reconcile would prune or skip) without writing the
+// index or touching any files. Used by `claude-memsync distill --dry-run`.
+func Preview(opts Options, prune bool) (Result, error) {
 	opts.applyDefaults()
 	entries, err := scanCatalog(opts.DistilledDir)
 	if err != nil {
 		return Result{}, fmt.Errorf("scan catalog: %w", err)
 	}
-	return analyze(opts, entries), nil
+	if !prune {
+		return analyze(opts, entries), nil
+	}
+	r, stale, err := reconcile(opts, entries, false)
+	if err != nil {
+		return Result{}, err
+	}
+	kept := entries[:0:0]
+	for _, e := range entries {
+		if !stale[e.Path] {
+			kept = append(kept, e)
+		}
+	}
+	res := analyze(opts, kept)
+	res.Pruned, res.Skipped, res.Unread = r.Pruned, r.Skipped, r.Unread
+	return res, nil
 }
 
 // BuildIndex parses every entry file in DistilledDir, regenerates the
@@ -175,51 +191,72 @@ func analyze(opts Options, entries []Entry) Result {
 //     never opened here, has a legitimately absent source. Reading that as "the
 //     user deleted it" would destroy the entry globally.
 //
+// originProject is the origin machine's folder name under ~/.claude/projects,
+// which Claude derives from the project's absolute path. A repo checked out at a
+// different path here has a different folder name, so its entries are skipped
+// too: only a machine with the project at the same path can judge them.
+//
 // The cost of this is that an entry whose project directory the user really did
 // delete stays in the catalog until removed by hand. That asymmetry is
 // deliberate — a missed prune is an annoyance, a wrong prune is data loss.
 func Reconcile(opts Options) (Result, error) {
 	opts.applyDefaults()
-	var res Result
-
-	if _, err := os.Stat(opts.ProjectsDir); err != nil {
-		return res, nil // sources not visible here; never prune blind
-	}
-
 	entries, err := scanCatalog(opts.DistilledDir)
 	if err != nil {
-		return res, fmt.Errorf("scan catalog: %w", err)
+		return Result{}, fmt.Errorf("scan catalog: %w", err)
 	}
+	res, _, err := reconcile(opts, entries, true)
+	return res, err
+}
+
+// reconcile judges each entry against its source and, when apply is set,
+// removes the stale ones. It returns the counts and the paths judged stale.
+func reconcile(opts Options, entries []Entry, apply bool) (Result, map[string]bool, error) {
+	var res Result
+	stale := map[string]bool{}
+
+	if _, err := os.Stat(opts.ProjectsDir); err != nil {
+		return res, stale, nil // sources not visible here; never prune blind
+	}
+
 	for _, e := range entries {
 		if e.OriginProject == "" || e.OriginFile == "" {
 			continue // hand-authored entry with no source; leave it alone
 		}
 		memDir := filepath.Join(opts.ProjectsDir, e.OriginProject, "memory")
 		if _, err := os.Stat(memDir); err != nil {
-			// Origin project absent on this workstation — unjudgeable, not stale.
-			res.Skipped++
+			if errors.Is(err, fs.ErrNotExist) {
+				// Origin project absent on this workstation — unjudgeable, not stale.
+				res.Skipped++
+			} else {
+				res.Unread++ // can't tell; don't prune on uncertainty
+			}
 			continue
 		}
-		src := filepath.Join(memDir, e.OriginFile)
-		content, err := os.ReadFile(src)
-		stale := false
+		content, err := os.ReadFile(filepath.Join(memDir, e.OriginFile))
+		isStale := false
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
-			stale = true
+			isStale = true
 		case err != nil:
-			continue // transient read error; don't prune on uncertainty
+			res.Unread++ // transient read error; don't prune on uncertainty
+			continue
 		default:
 			meta, _, _ := parseFrontmatter(string(content))
-			stale = meta[opts.Marker.Key] != opts.Marker.Value
+			isStale = meta[opts.Marker.Key] != opts.Marker.Value
 		}
-		if stale {
+		if !isStale {
+			continue
+		}
+		if apply {
 			if err := os.Remove(e.Path); err != nil {
-				return res, fmt.Errorf("prune %s: %w", e.Path, err)
+				return res, stale, fmt.Errorf("prune %s: %w", e.Path, err)
 			}
-			res.Pruned++
 		}
+		stale[e.Path] = true
+		res.Pruned++
 	}
-	return res, nil
+	return res, stale, nil
 }
 
 // scanCatalog loads every entry file in dir, sorted by name. A missing dir is

@@ -144,15 +144,25 @@ If you're not running the daemon, or want to refresh by hand:
 claude-memsync distill            # rebuild DISTILLED.md, report worklist
 claude-memsync distill --dry-run  # show what would change, write nothing
 claude-memsync distill --prune    # also remove entries whose source is gone
+claude-memsync distill --dry-run --prune  # show what --prune would remove
 ```
 
-`--prune` only judges entries whose **origin project exists on the machine you
-run it from**. The catalog is shared, so an entry distilled on one workstation
-from a repo you have never opened here has a legitimately absent source —
-pruning it would push that deletion to all your machines. Those entries are
-reported as `kept … (can't judge from here)` and left alone. To retire one,
-either run `--prune` on the machine that owns the source project, or delete the
+`--prune` only judges entries whose **origin project folder exists on the
+machine you run it from**. That folder is the entry's `originProject`: the
+`~/.claude/projects/<folder>` name Claude derives from the project's absolute
+path on the machine where it was distilled. The catalog is shared, so an entry
+distilled on one workstation from a repo you have never opened here has a
+legitimately absent source — pruning it would push that deletion to all your
+machines. The same applies to a repo you *do* have here but checked out at a
+different path: its folder name differs, so the source can't be found. Those
+entries are reported as `kept … (can't judge from here)` and left alone. To
+retire one, either run `--prune` on a machine where the project is checked out
+at the same path as on the machine it was distilled from, or delete the
 `<slug>.md` by hand.
+
+Entries whose source exists but couldn't be read (a permissions or I/O error)
+are never pruned either; they're reported as `kept … whose source couldn't be
+read`.
 
 The CLI prints:
 
@@ -199,8 +209,8 @@ to know what belongs.
   them into one generalized entry.
 - **A distilled lesson no longer applies.** Delete its `<slug>.md` from the
   catalog (or remove the `scope: environment` tag from the source and run
-  `claude-memsync distill --prune` **on the machine holding that source
-  project** — prune skips entries it cannot verify from where it is run).
+  `claude-memsync distill --prune` **on a machine with that source project at
+  the same path** — prune skips entries it cannot verify from where it is run).
 - **`DISTILLED.md` looks stale.** It's a derived file, regenerated locally; run
   `claude-memsync distill` to rebuild it. It is intentionally not synced (each PC
   regenerates its own to avoid merge conflicts on the generated table).
