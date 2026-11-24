@@ -39,6 +39,164 @@ func TestParse_PreambleAndSections(t *testing.T) {
 	}
 }
 
+func TestParse_DuplicateHeadingsGetDistinctKeys(t *testing.T) {
+	in := "# T\n\n## Notes\nfirst\n\n## Notes\nsecond\n"
+	got := Parse(in)
+	if len(got) != 3 {
+		t.Fatalf("want 3 blocks (preamble + 2 sections), got %d: %#v", len(got), got)
+	}
+	if got[1].Key == got[2].Key {
+		t.Fatalf("repeated headings must get distinct keys; both are %q", got[1].Key)
+	}
+	if got[1].Key != "notes" {
+		t.Errorf("first occurrence should keep the plain key, got %q", got[1].Key)
+	}
+	if !strings.Contains(got[1].Body, "first") || !strings.Contains(got[2].Body, "second") {
+		t.Errorf("bodies mismatched: %q / %q", got[1].Body, got[2].Body)
+	}
+}
+
+// A MEMORY.md that repeats an H2 must survive a merge intact. Before the
+// occurrence-numbering fix, blocksByKey collapsed both sections into one map
+// entry and the first one's body was dropped — even here, where all three
+// inputs are byte-identical and the merge should be a no-op.
+func TestMerge_DuplicateHeadingsPreserved(t *testing.T) {
+	doc := "# T\n\n## Notes\nfirst\n\n## Notes\nsecond\n"
+
+	got, conflict := Merge(doc, doc, doc)
+	if conflict {
+		t.Fatalf("identical inputs must not conflict; got=%q", got)
+	}
+	if n := strings.Count(got, "## Notes"); n != 2 {
+		t.Errorf("expected both Notes headings preserved, got %d in %q", n, got)
+	}
+	for _, want := range []string{"first", "second"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lost body %q: %q", want, got)
+		}
+	}
+}
+
+// Keys are lowercased so "## Deploy" on one PC matches "## deploy" on another.
+// That must not make two case-variant headings in the *same* file collapse.
+func TestMerge_CaseVariantHeadingsBothKept(t *testing.T) {
+	doc := "# T\n\n## Notes\nupper\n\n## notes\nlower\n"
+
+	got, conflict := Merge(doc, doc, doc)
+	if conflict {
+		t.Fatalf("identical inputs must not conflict; got=%q", got)
+	}
+	for _, want := range []string{"upper", "lower"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lost body %q: %q", want, got)
+		}
+	}
+}
+
+// Each occurrence is merged against its own counterpart, so edits to different
+// repeats of the same heading combine cleanly instead of fighting.
+func TestMerge_DuplicateHeadingsMatchByOccurrence(t *testing.T) {
+	base := "## Notes\nfirst\n\n## Notes\nsecond\n"
+	ours := "## Notes\nfirst edited by us\n\n## Notes\nsecond\n"
+	theirs := "## Notes\nfirst\n\n## Notes\nsecond edited by them\n"
+
+	got, conflict := Merge(base, ours, theirs)
+	if conflict {
+		t.Fatalf("edits to different occurrences should merge cleanly; got=%q", got)
+	}
+	if !strings.Contains(got, "first edited by us") {
+		t.Errorf("lost our edit to the first occurrence: %q", got)
+	}
+	if !strings.Contains(got, "second edited by them") {
+		t.Errorf("lost their edit to the second occurrence: %q", got)
+	}
+}
+
+// Deleting an earlier copy must not shift the later copies onto the wrong
+// counterpart. Matching by position alone paired ours' surviving "second" with
+// base's "first", so theirs' edit to "second" came back next to the stale
+// original, with no conflict reported.
+func TestMerge_DuplicateDeletedOnOneSideEditedOnOther(t *testing.T) {
+	base := "## Notes\nfirst\n\n## Notes\nsecond\n"
+	ours := "## Notes\nsecond\n"
+	theirs := "## Notes\nfirst\n\n## Notes\nsecond edited by them\n"
+
+	got, conflict := Merge(base, ours, theirs)
+	want := "## Notes\nsecond edited by them\n"
+	if conflict || got != want {
+		t.Fatalf("got (%v) %q, want %q", conflict, got, want)
+	}
+}
+
+func TestMerge_DuplicateDeletedOnOneSideUntouchedOnOther(t *testing.T) {
+	base := "## Notes\nfirst\n\n## Notes\nsecond\n"
+	ours := "## Notes\nsecond\n"
+
+	got, conflict := Merge(base, ours, base)
+	if conflict || got != ours {
+		t.Fatalf("got (%v) %q, want %q", conflict, got, ours)
+	}
+}
+
+// Inserting a new copy above an existing one must not pair the new copy with
+// the old one. Matching by position alone reported a conflict between "new"
+// and theirs' edit and kept a stale copy of "first" as well.
+func TestMerge_DuplicateInsertedAboveEditedCopy(t *testing.T) {
+	base := "## Notes\nfirst\n"
+	ours := "## Notes\nnew\n\n## Notes\nfirst\n"
+	theirs := "## Notes\nfirst edited by them\n"
+
+	got, conflict := Merge(base, ours, theirs)
+	want := "## Notes\nnew\n\n## Notes\nfirst edited by them\n"
+	if conflict || got != want {
+		t.Fatalf("got (%v) %q, want %q", conflict, got, want)
+	}
+}
+
+// Reconcile merges with an empty base, so copies are matched between ours and
+// theirs directly: a copy both sides have is kept once, extra copies are kept.
+func TestMerge_DuplicatesWithEmptyBase(t *testing.T) {
+	ours := "## Notes\nb\n"
+	theirs := "## Notes\na\n\n## Notes\nb\n"
+
+	got, conflict := Merge("", ours, theirs)
+	if conflict {
+		t.Fatalf("unexpected conflict: %q", got)
+	}
+	if strings.Count(got, "## Notes") != 2 || strings.Count(got, "b\n") != 1 || !strings.Contains(got, "a\n") {
+		t.Fatalf("want one copy each of a and b, got %q", got)
+	}
+}
+
+// Both sides adding the same new copy keeps it once, as for any other section.
+func TestMerge_SameDuplicateAddedOnBothSides(t *testing.T) {
+	base := "## Notes\na\n"
+	both := "## Notes\na\n\n## Notes\nb\n"
+
+	got, conflict := Merge(base, both, both)
+	if conflict || got != both {
+		t.Fatalf("got (%v) %q, want %q", conflict, got, both)
+	}
+}
+
+// When both sides change the copies so no copy anchors the alignment, the
+// overlap must surface as a conflict rather than disappear.
+func TestMerge_DuplicatesBothChangedSurfaceConflict(t *testing.T) {
+	base := "## Notes\na\n\n## Notes\nb\n"
+	ours := "## Notes\na edited\n\n## Notes\nb\n"
+	theirs := "## Notes\nb edited\n"
+
+	got, conflict := Merge(base, ours, theirs)
+	if !conflict {
+		t.Fatalf("expected a conflict, got %q", got)
+	}
+	for _, want := range []string{"a edited", "b edited"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lost %q: %q", want, got)
+		}
+	}
+}
+
 func TestMerge_BothAddDisjointSections(t *testing.T) {
 	base := "# Project\n"
 	ours := "# Project\n\n## Deploy\nuse helm.\n"

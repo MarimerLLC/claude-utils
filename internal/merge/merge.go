@@ -36,9 +36,26 @@ type Block struct {
 	Body    string // raw body content from after heading line up to next heading
 }
 
+// dupKeySep separates a heading key from its occurrence number when one
+// document repeats the same H2 (or two headings that differ only in case,
+// since keys are lowercased). Without this, blocksByKey would collapse them
+// into a single map entry and every section but the last would be dropped —
+// silent data loss, even on a merge where nothing actually changed.
+//
+// The separator is a NUL byte because it cannot occur in real markdown, so a
+// disambiguated key can never collide with a genuine heading's key. Keys are
+// internal to the merge algorithm and never appear in the output; only
+// Block.Heading is written.
+const dupKeySep = "\x00#"
+
 var headingRe = regexp.MustCompile(`(?m)^##[ \t]+.*$`)
 
-// Parse splits MEMORY.md content into blocks keyed by H2 heading.
+// Parse splits MEMORY.md content into blocks keyed by H2 heading. Repeated
+// headings within one document are disambiguated by occurrence, so no block
+// is lost when blocks are mapped by key. Cross-document matching stays
+// case-insensitive; only same-document repeats are separated. Merge then
+// re-keys repeats with alignRepeats, so a copy is matched to the copy it came
+// from rather than to whichever copy sits at the same position.
 func Parse(content string) []Block {
 	indices := headingRe.FindAllStringIndex(content, -1)
 	if len(indices) == 0 {
@@ -48,6 +65,7 @@ func Parse(content string) []Block {
 	if indices[0][0] > 0 {
 		blocks = append(blocks, Block{Heading: "", Key: PreambleKey, Body: content[:indices[0][0]]})
 	}
+	occurrences := map[string]int{}
 	for i, idx := range indices {
 		start := idx[0]
 		end := len(content)
@@ -64,6 +82,12 @@ func Parse(content string) []Block {
 			body = content[start+hdrEnd+1 : end]
 		}
 		key := normalizeKey(strings.TrimSpace(strings.TrimLeft(strings.TrimRight(heading, "\r\n"), "#")))
+		occurrences[key]++
+		// First occurrence keeps the plain key so cross-document matching is
+		// unaffected; repeats get an occurrence-numbered variant.
+		if n := occurrences[key]; n > 1 {
+			key = fmt.Sprintf("%s%s%d", key, dupKeySep, n)
+		}
 		blocks = append(blocks, Block{Heading: heading, Key: key, Body: body})
 	}
 	return blocks
@@ -86,6 +110,7 @@ func Merge(base, ours, theirs string) (string, bool) {
 	bb := Parse(base)
 	ob := Parse(ours)
 	tb := Parse(theirs)
+	alignRepeats(bb, ob, tb)
 
 	baseMap := blocksByKey(bb)
 	oursMap := blocksByKey(ob)
@@ -198,6 +223,158 @@ func chooseHeading(o, t, b Block, inBase bool) string {
 		return o.Heading
 	}
 	return o.Heading
+}
+
+// groupKey returns the heading key a block was parsed under, without the
+// occurrence suffix Parse adds to a repeated heading.
+func groupKey(key string) string {
+	g, _, _ := strings.Cut(key, dupKeySep)
+	return g
+}
+
+// alignRepeats re-keys the copies of each repeated heading so that every copy
+// in ours and theirs is matched to the base copy it came from, not merely to
+// the copy at the same position. Parse numbers repeats by position alone,
+// which goes wrong as soon as one side adds or deletes an earlier copy: every
+// later copy shifts onto the wrong counterpart, and the merge then brings back
+// deleted text or reports a conflict between unrelated sections.
+//
+// Copies are aligned the way a line diff aligns lines. Copies whose body is
+// unchanged from a base copy are anchors, found as a longest common
+// subsequence so their order is respected. Between two anchors, the remaining
+// copies pair with the remaining base copies in order. Copies that neither
+// side matched to base are aligned between ours and theirs the same way, and
+// any copy still unmatched gets a key of its own, so it is kept.
+//
+// Headings that appear at most once in every version are left alone, so their
+// matching is exactly what it was before.
+func alignRepeats(base, ours, theirs []Block) {
+	type copies struct{ base, ours, theirs []int }
+	groups := map[string]*copies{}
+	collect := func(blocks []Block, pick func(*copies) *[]int) {
+		for i, b := range blocks {
+			if b.Heading == "" {
+				continue // preamble
+			}
+			g := groupKey(b.Key)
+			if groups[g] == nil {
+				groups[g] = &copies{}
+			}
+			p := pick(groups[g])
+			*p = append(*p, i)
+		}
+	}
+	collect(base, func(c *copies) *[]int { return &c.base })
+	collect(ours, func(c *copies) *[]int { return &c.ours })
+	collect(theirs, func(c *copies) *[]int { return &c.theirs })
+
+	bodies := func(blocks []Block, idx []int) []string {
+		out := make([]string, len(idx))
+		for i, j := range idx {
+			out[i] = blocks[j].Body
+		}
+		return out
+	}
+
+	for g, c := range groups {
+		if len(c.base) <= 1 && len(c.ours) <= 1 && len(c.theirs) <= 1 {
+			continue
+		}
+		baseBodies := bodies(base, c.base)
+
+		// Match each side against base; base copies keep their Parse keys.
+		leftovers := func(blocks []Block, idx []int) []int {
+			var rest []int
+			for i, m := range alignCopies(bodies(blocks, idx), baseBodies) {
+				if m >= 0 {
+					blocks[idx[i]].Key = base[c.base[m]].Key
+				} else {
+					rest = append(rest, idx[i])
+				}
+			}
+			return rest
+		}
+		restO := leftovers(ours, c.ours)
+		restT := leftovers(theirs, c.theirs)
+
+		// Copies with no base counterpart: pair ours with theirs, so the same
+		// copy added (or kept, with an empty base) on both sides is merged
+		// rather than duplicated.
+		pairedT := make([]bool, len(restT))
+		for i, m := range alignCopies(bodies(ours, restO), bodies(theirs, restT)) {
+			if m >= 0 {
+				k := fmt.Sprintf("%s%snew%d", g, dupKeySep, i)
+				ours[restO[i]].Key = k
+				theirs[restT[m]].Key = k
+				pairedT[m] = true
+			} else {
+				ours[restO[i]].Key = fmt.Sprintf("%s%sours%d", g, dupKeySep, i)
+			}
+		}
+		for j, paired := range pairedT {
+			if !paired {
+				theirs[restT[j]].Key = fmt.Sprintf("%s%stheirs%d", g, dupKeySep, j)
+			}
+		}
+	}
+}
+
+// alignCopies matches the bodies in a to the bodies in b, preserving order,
+// and returns for each element of a the index of its match in b, or -1.
+// Equal bodies are matched first (a longest common subsequence); between two
+// such anchors, unmatched elements of a and b pair up in order.
+func alignCopies(a, b []string) []int {
+	n, m := len(a), len(b)
+	// lcs[i][j] is the length of the longest common subsequence of a[i:] and b[j:].
+	lcs := make([][]int, n+1)
+	for i := range lcs {
+		lcs[i] = make([]int, m+1)
+	}
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			if bodyEqual(a[i], b[j]) {
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			} else {
+				lcs[i][j] = max(lcs[i+1][j], lcs[i][j+1])
+			}
+		}
+	}
+
+	match := make([]int, n)
+	for i := range match {
+		match[i] = -1
+	}
+	var gapA, gapB []int
+	flush := func() {
+		for k := 0; k < len(gapA) && k < len(gapB); k++ {
+			match[gapA[k]] = gapB[k]
+		}
+		gapA, gapB = gapA[:0], gapB[:0]
+	}
+	i, j := 0, 0
+	for i < n && j < m {
+		switch {
+		case bodyEqual(a[i], b[j]):
+			flush()
+			match[i] = j
+			i++
+			j++
+		case lcs[i+1][j] >= lcs[i][j+1]:
+			gapA = append(gapA, i)
+			i++
+		default:
+			gapB = append(gapB, j)
+			j++
+		}
+	}
+	for ; i < n; i++ {
+		gapA = append(gapA, i)
+	}
+	for ; j < m; j++ {
+		gapB = append(gapB, j)
+	}
+	flush()
+	return match
 }
 
 func blocksByKey(blocks []Block) map[string]Block {
