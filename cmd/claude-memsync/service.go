@@ -2,17 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kardianos/service"
 
 	"github.com/MarimerLLC/claude-utils/internal/config"
+	"github.com/MarimerLLC/claude-utils/internal/gitwt"
 	syncpkg "github.com/MarimerLLC/claude-utils/internal/sync"
 )
 
@@ -162,13 +166,49 @@ func runStop(args []string) int {
 }
 
 func runStatus(args []string) int {
+	flags := flag.NewFlagSet("status", flag.ContinueOnError)
+	cfgPath := flags.String("config", "", "path to config.json, if the daemon was installed with --config (default: ~/.claudesync/config.json)")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if *cfgPath == "" {
+		*cfgPath = defaultConfigPath()
+	}
 	st, err := statusTask()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "status:", err)
 		return 1
 	}
 	fmt.Println(st)
+	if line := syncHealthLine(*cfgPath); line != "" {
+		fmt.Println(line)
+	}
 	return 0
+}
+
+// syncHealthLine reports how the daemon's syncs are going, from the health
+// file it writes and the local copy of origin's branch (no network call).
+// The exit code of `status` never depends on it, so scripts that check only
+// the daemon keep working. Empty only when the default config doesn't exist
+// (not initialized here); a config named with --config that can't be read is
+// reported, not hidden.
+func syncHealthLine(configPath string) string {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		if configPath == defaultConfigPath() && errors.Is(err, fs.ErrNotExist) {
+			return ""
+		}
+		return "sync: can't read config " + configPath + ": " + err.Error()
+	}
+	h, err := syncpkg.LoadHealth(cfg.SyncDir)
+	if err != nil {
+		return "sync: health record unreadable: " + err.Error()
+	}
+	ahead, behind, err := gitwt.New(cfg.SyncDir).AheadBehind("main")
+	if err != nil {
+		ahead, behind = -1, -1
+	}
+	return syncpkg.FormatHealth(h, ahead, behind, time.Local)
 }
 
 // runService is the entry point for `claude-memsync run`. It wraps the loop

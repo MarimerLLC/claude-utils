@@ -39,9 +39,9 @@ func TestPriorVersionIn_FindsHistoricalBlob(t *testing.T) {
 	}
 }
 
-// A pull --rebase that stops on a conflict must be detectable and abortable,
-// so the daemon doesn't stay wedged mid-rebase.
-func TestRebaseInProgress_AbortRecovers(t *testing.T) {
+// A pull that stops on a conflict must be detectable and abortable, and so
+// must a rebase an older daemon left behind, so the daemon never stays wedged.
+func TestMergeAndRebaseInProgress_AbortRecovers(t *testing.T) {
 	root := t.TempDir()
 	bare := filepath.Join(root, "remote.git")
 	gitRun(t, root, "init", "-q", "--bare", "-b", "main", bare)
@@ -77,6 +77,23 @@ func TestRebaseInProgress_AbortRecovers(t *testing.T) {
 	repo := gitwt.New(b)
 	if err := repo.Pull("main"); err == nil {
 		t.Fatal("expected a conflicting pull to fail")
+	}
+	if !repo.MergeInProgress() {
+		t.Fatal("expected a merge in progress after the conflict")
+	}
+	if repo.RebaseInProgress() {
+		t.Fatal("pull must merge, not rebase")
+	}
+	if err := repo.AbortMerge(); err != nil {
+		t.Fatal(err)
+	}
+	if repo.MergeInProgress() {
+		t.Fatal("merge still in progress after abort")
+	}
+
+	// What an older daemon's `pull --rebase` left behind.
+	if _, err := repo.Run("rebase", "refs/remotes/origin/main"); err == nil {
+		t.Fatal("expected a conflicting rebase to stop")
 	}
 	if !repo.RebaseInProgress() {
 		t.Fatal("expected a rebase in progress after the conflict")

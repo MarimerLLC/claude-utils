@@ -58,6 +58,11 @@ func (l *Loop) Run(ctx context.Context) error {
 	if !repo.IsRepo() {
 		return fmt.Errorf("sync dir %s is not a git repo — run `claude-memsync init` first", l.Cfg.SyncDir)
 	}
+	if err := recoverInterruptedGitOp(repo); err != nil {
+		// Keep running: every sync retries the reset and refuses to stage
+		// until it works, and records the failure for `status` to show.
+		log.Println("startup:", err)
+	}
 
 	mirrorProjects := filepath.Join(l.Cfg.SyncDir, "projects")
 	roots := Roots{Claude: l.Cfg.ClaudeProjectsDir, Mirror: mirrorProjects}
@@ -118,10 +123,11 @@ func (l *Loop) Run(ctx context.Context) error {
 		log.Println("load manifest (continuing without delete detection):", err)
 		manifest = NewManifest()
 	}
+	var reconErr error
 	if _, err := Reconcile(roots, l.idx, manifest); err != nil {
-		log.Println("initial reconcile:", err)
+		reconErr = fmt.Errorf("reconcile: %w", err)
 	}
-	if err := l.flush(repo, roots, true); err != nil {
+	if err := l.flush(repo, roots, true, reconErr); err != nil {
 		log.Println("initial flush:", err)
 		if l.OnFlush != nil {
 			l.OnFlush(true, err)
@@ -160,6 +166,7 @@ func (l *Loop) Run(ctx context.Context) error {
 			log.Println("watcher error:", err)
 
 		case <-debounce.C:
+			var reconErr error
 			if l.needReconcile {
 				// An event couldn't be applied incrementally (new project, or a
 				// sibling checkout with its own edit); re-index and reconcile so
@@ -173,10 +180,10 @@ func (l *Loop) Run(ctx context.Context) error {
 					m = NewManifest()
 				}
 				if _, err := Reconcile(roots, l.idx, m); err != nil {
-					log.Println("reconcile:", err)
+					reconErr = fmt.Errorf("reconcile: %w", err)
 				}
 			}
-			err := l.flush(repo, roots, true)
+			err := l.flush(repo, roots, true, reconErr)
 			if err != nil {
 				log.Println("flush (local):", err)
 			} else {
@@ -208,10 +215,11 @@ func (l *Loop) Run(ctx context.Context) error {
 			// pre-upgrade PCs made to legacy dirs, before reconciling.
 			l.rebuildIndex(roots)
 			l.migrate(repo, roots)
+			var reconErr error
 			if _, err := Reconcile(roots, l.idx, m); err != nil {
-				log.Println("reconcile:", err)
+				reconErr = fmt.Errorf("reconcile: %w", err)
 			}
-			err = l.flush(repo, roots, true)
+			err = l.flush(repo, roots, true, reconErr)
 			if err != nil {
 				log.Println("flush (pull):", err)
 			}
@@ -282,14 +290,46 @@ func (l *Loop) handleEvent(watcher *fsnotify.Watcher, roots Roots, ev fsnotify.E
 	return true, nil
 }
 
-// flush stages local changes, optionally commits, pulls remote work, propagates
-// any pull-driven changes back to the Claude tree, and pushes.
+// flush runs one sync (syncOnce) and records its outcome in the health file
+// that `claude-memsync status` reads. prior is any error from the tick's
+// earlier steps (Reconcile): local memories that couldn't be mirrored aren't
+// synced either, so the tick is recorded (and returned) as failed even if the
+// git phase itself succeeded.
+func (l *Loop) flush(repo *gitwt.Repo, roots Roots, includeLocal bool, prior error) error {
+	err := errors.Join(prior, l.syncOnce(repo, roots, includeLocal))
+	h, lerr := LoadHealth(l.Cfg.SyncDir)
+	if lerr != nil {
+		log.Println("load sync health (starting fresh):", lerr)
+		h = Health{}
+	}
+	h.Record(time.Now().UTC(), err)
+	if serr := h.Save(l.Cfg.SyncDir); serr != nil {
+		log.Println("save sync health:", serr)
+	}
+	return err
+}
+
+// syncOnce stages local changes, optionally commits, pulls remote work,
+// propagates any pull-driven changes back to the Claude tree, and pushes.
 //
-// Before doing any pull/push, flush asks origin for the current branch SHA
+// Before doing any pull/push, it asks origin for the current branch SHA
 // (a single ls-remote round-trip). If origin's SHA matches our cached
-// refs/remotes/origin/<branch> AND we have no unpushed commits, it returns
-// early — skipping the full pull/push churn that dominates idle ticks.
-func (l *Loop) flush(repo *gitwt.Repo, roots Roots, includeLocal bool) error {
+// refs/remotes/origin/<branch> AND HEAD, it returns early — skipping the full
+// pull/push churn that dominates idle ticks. That counts as a successful sync:
+// this PC was just shown to match origin.
+//
+// The pull always merges. A conflict is resolved here (resolveConflicts) and
+// the merge committed, so one bad file can no longer wedge every later sync;
+// if it can't be resolved the merge is aborted and the error returned.
+func (l *Loop) syncOnce(repo *gitwt.Repo, roots Roots, includeLocal bool) error {
+	// Never stage while a merge or rebase is half-done: `git add -A` would
+	// mark its conflicted files resolved, markers and all, and the commit
+	// below would complete the merge with them. Back out first, or stop.
+	if repo.MergeInProgress() || repo.RebaseInProgress() {
+		if err := recoverInterruptedGitOp(repo); err != nil {
+			return fmt.Errorf("sync repo %s is mid-merge or mid-rebase and couldn't be reset; nothing staged: %w", repo.Dir, err)
+		}
+	}
 	if includeLocal {
 		if err := repo.AddAll(); err != nil {
 			return fmt.Errorf("add: %w", err)
@@ -300,36 +340,93 @@ func (l *Loop) flush(repo *gitwt.Repo, roots Roots, includeLocal bool) error {
 		}
 	}
 
-	if idle, err := remoteAndLocalIdle(repo, l.Branch); err == nil && idle {
+	remoteSHA, err := repo.LsRemoteHead(l.Branch)
+	if err != nil {
+		return fmt.Errorf("ls-remote: %w", err)
+	}
+	if remoteSHA != "" && idleAgainst(repo, l.Branch, remoteSHA) {
 		return nil
 	}
 
 	preRev, _ := repo.Run("rev-parse", "HEAD")
-	if err := repo.Pull(l.Branch); err != nil {
-		// Don't propagate first-time failure (no upstream yet); push will create it.
-		log.Println("pull:", err)
-		// A conflict the merge driver can't resolve (modify/delete, a non-
-		// MEMORY.md overlap) leaves the work-tree mid-rebase, which would wedge
-		// every later sync. Back out; the local commits stay and are retried.
-		if repo.RebaseInProgress() {
-			if aerr := repo.AbortRebase(); aerr != nil {
-				log.Println("abort stuck rebase:", aerr)
-			} else {
-				log.Println("aborted conflicting rebase; will retry on the next sync")
-			}
-		}
+	var pullErr error
+	if remoteSHA != "" {
+		// When origin has no branch yet there is nothing to pull; the push
+		// below creates it.
+		pullErr = l.pull(repo)
 	}
 	postRev, _ := repo.Run("rev-parse", "HEAD")
 	if strings.TrimSpace(preRev) != strings.TrimSpace(postRev) && strings.TrimSpace(preRev) != "" {
 		if err := propagateChanges(repo, roots, l.idx, strings.TrimSpace(preRev), strings.TrimSpace(postRev)); err != nil {
-			return fmt.Errorf("propagate: %w", err)
+			return errors.Join(pullErr, fmt.Errorf("propagate: %w", err))
 		}
 	}
 
+	var pushErr error
 	if err := repo.Push(l.Branch); err != nil {
-		return fmt.Errorf("push: %w", err)
+		pushErr = fmt.Errorf("push: %w", err)
 	}
-	return nil
+	return errors.Join(pullErr, pushErr)
+}
+
+// pull merges origin's branch into HEAD, resolving any conflicts and
+// committing the merge. When resolution fails the merge is aborted (restoring
+// the pre-pull state) and an error returned; the next sync tries again.
+func (l *Loop) pull(repo *gitwt.Repo) error {
+	err := repo.Pull(l.Branch)
+	if err == nil {
+		return nil
+	}
+	if !repo.MergeInProgress() {
+		return fmt.Errorf("pull: %w", err)
+	}
+	res, rerr := resolveConflicts(repo)
+	if rerr == nil {
+		msg := fmt.Sprintf("auto: %s merge @ %s", l.Hostname, time.Now().UTC().Format(time.RFC3339))
+		if rerr = repo.CommitMerge(msg); rerr == nil {
+			if len(res.Files) > 0 {
+				log.Printf("resolved %d merge conflict(s): %s", len(res.Files), res)
+			}
+			// Only now that the merge is committed: an aborted, retried merge
+			// must not leave a fresh backup behind on every tick. The merge
+			// stands either way, so a failed write is logged, not returned.
+			if werr := res.WriteBackups(repo.Dir); werr != nil {
+				log.Println("write conflict backups:", werr)
+			}
+			return nil
+		}
+		rerr = fmt.Errorf("commit merge: %w", rerr)
+	}
+	if aerr := repo.AbortMerge(); aerr != nil {
+		return fmt.Errorf("pull: resolve conflicts: %w; abort merge: %v", rerr, aerr)
+	}
+	return fmt.Errorf("pull: resolve conflicts (merge aborted; will retry): %w", rerr)
+}
+
+// recoverInterruptedGitOp backs out of a rebase or merge left half-done (by a
+// daemon that stopped mid-sync — an older version rebased on every pull — or
+// by hand), so syncing starts from a clean work-tree. The local commits are
+// kept. It returns an error if either operation is still in progress after.
+func recoverInterruptedGitOp(repo *gitwt.Repo) error {
+	var errs []error
+	if repo.RebaseInProgress() {
+		if err := repo.AbortRebase(); err != nil {
+			errs = append(errs, fmt.Errorf("abort leftover rebase: %w", err))
+		} else {
+			log.Println("aborted a leftover rebase")
+		}
+	}
+	if repo.MergeInProgress() {
+		if err := repo.AbortMerge(); err != nil {
+			errs = append(errs, fmt.Errorf("abort leftover merge: %w", err))
+		} else {
+			log.Println("aborted a leftover merge")
+		}
+	}
+	if repo.RebaseInProgress() || repo.MergeInProgress() {
+		errs = append(errs, errors.New("a merge or rebase is still in progress"))
+	}
+	return errors.Join(errs...)
 }
 
 // remoteAndLocalIdle reports whether there is nothing to do: origin's branch
@@ -349,20 +446,26 @@ func remoteAndLocalIdle(repo *gitwt.Repo, branch string) (bool, error) {
 	if err != nil || remoteSHA == "" {
 		return false, err
 	}
+	return idleAgainst(repo, branch, remoteSHA), nil
+}
+
+// idleAgainst is remoteAndLocalIdle for an origin SHA already fetched with
+// ls-remote.
+func idleAgainst(repo *gitwt.Repo, branch, remoteSHA string) bool {
 	cachedSHA, err := repo.Run("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch)
 	if err != nil {
-		return false, nil // remote-tracking ref missing → can't prove idle
+		return false // remote-tracking ref missing → can't prove idle
 	}
 	if strings.TrimSpace(cachedSHA) != remoteSHA {
-		return false, nil // remote moved
+		return false // remote moved
 	}
 	headSHA, err := repo.Run("rev-parse", "--verify", "--quiet", "HEAD")
 	if err != nil {
-		return false, nil
+		return false
 	}
 	// HEAD ahead (unpushed), behind (fetched but not merged), or diverged
 	// all mean there's work for pull/push to do.
-	return strings.TrimSpace(headSHA) == remoteSHA, nil
+	return strings.TrimSpace(headSHA) == remoteSHA
 }
 
 // propagateChanges replays the file changes between pre and post revisions from

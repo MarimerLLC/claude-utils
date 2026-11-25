@@ -10,7 +10,8 @@
 // blocks (a leading preamble plus zero or more sections), then merge by
 // section key. Within a section, if both bodies are pure markdown lists,
 // we union by the link target (or full line). Otherwise we shell out to
-// `git merge-file` for a standard 3-way text merge of the body.
+// `git merge-file --union` for a 3-way text merge of the body that keeps both
+// sides' lines where they overlap, so the result never holds conflict markers.
 package merge
 
 import (
@@ -105,7 +106,9 @@ func bodyEqual(a, b string) bool {
 }
 
 // Merge performs a 3-way semantic merge of MEMORY.md content.
-// Returns the merged content and whether unresolved conflicts remain.
+// Returns the merged content and whether it is unusable: that happens only
+// when git could not be run to merge a section body. Overlapping edits keep
+// both versions instead of producing conflict markers.
 func Merge(base, ours, theirs string) (string, bool) {
 	bb := Parse(base)
 	ob := Parse(ours)
@@ -449,13 +452,36 @@ func mergeList(ours, theirs string) string {
 	return body
 }
 
-// mergeDiff3 shells out to `git merge-file -p` for a 3-way text merge.
-// Returns the merged content (which may contain conflict markers) and whether
-// any conflicts occurred.
+// mergeDiff3 runs a 3-way text merge of one section body with
+// `git merge-file --union`: where both sides changed the same lines, both
+// versions are kept (ours first), so MEMORY.md never gets conflict markers.
+// It reports a conflict only when git itself could not be run; the result is
+// then ours plus a comment saying so.
 func mergeDiff3(base, ours, theirs string) (string, bool) {
+	result, _, err := MergeFile([]byte(base), []byte(ours), []byte(theirs), FavorUnion)
+	if err != nil {
+		return ours + fmt.Sprintf("\n<!-- claude-memmerge: git merge-file failed: %s -->\n", err), true
+	}
+	return string(result), false
+}
+
+// Favor selects how MergeFile settles lines both sides changed.
+type Favor string
+
+const (
+	FavorNone   Favor = ""       // leave conflict markers
+	FavorOurs   Favor = "ours"   // take ours for each conflicting hunk
+	FavorTheirs Favor = "theirs" // take theirs for each conflicting hunk
+	FavorUnion  Favor = "union"  // keep both sides' lines for each conflicting hunk
+)
+
+// MergeFile runs `git merge-file -p` on the three versions and returns the
+// merged content and the number of conflicting hunks (always 0 unless favor
+// is FavorNone). err is non-nil only when git could not be run.
+func MergeFile(base, ours, theirs []byte, favor Favor) ([]byte, int, error) {
 	dir, err := os.MkdirTemp("", "memmerge-*")
 	if err != nil {
-		return ours, true
+		return nil, 0, err
 	}
 	defer os.RemoveAll(dir)
 
@@ -463,31 +489,32 @@ func mergeDiff3(base, ours, theirs string) (string, bool) {
 	op := filepath.Join(dir, "ours")
 	tp := filepath.Join(dir, "theirs")
 	for _, w := range []struct {
-		path, content string
+		path    string
+		content []byte
 	}{{bp, base}, {op, ours}, {tp, theirs}} {
-		if err := os.WriteFile(w.path, []byte(w.content), 0600); err != nil {
-			return ours, true
+		if err := os.WriteFile(w.path, w.content, 0600); err != nil {
+			return nil, 0, err
 		}
 	}
 
-	cmd := exec.Command("git", "merge-file", "-p", op, bp, tp)
+	args := []string{"merge-file", "-p"}
+	if favor != FavorNone {
+		args = append(args, "--"+string(favor))
+	}
+	args = append(args, op, bp, tp)
+	cmd := exec.Command("git", args...)
 	proc.HideWindow(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err = cmd.Run()
-	result := stdout.String()
-
 	if err == nil {
-		return result, false
+		return stdout.Bytes(), 0, nil
 	}
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		// Positive exit code = number of conflicts; negative = error.
-		if exitErr.ExitCode() > 0 {
-			return result, true
-		}
+	if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 && exitErr.ExitCode() < 128 {
+		// Positive exit code = number of conflicts (capped at 127).
+		return stdout.Bytes(), exitErr.ExitCode(), nil
 	}
-	// Hard error invoking git — fall back to ours with conflict marker block.
-	return ours + fmt.Sprintf("\n<!-- claude-memmerge: git merge-file failed: %s -->\n", strings.TrimSpace(stderr.String())), true
+	return nil, 0, fmt.Errorf("git merge-file: %w: %s", err, strings.TrimSpace(stderr.String()))
 }
