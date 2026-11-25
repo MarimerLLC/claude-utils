@@ -128,7 +128,7 @@ and SSH keys. None require root.
 | `claude-memsync uninstall` | Remove the auto-start hook. |
 | `claude-memsync start` | Start the daemon now. |
 | `claude-memsync stop` | Stop the running daemon. |
-| `claude-memsync status` | Print `running (pid N)` or `stopped`. |
+| `claude-memsync status` | Print `running (pid N)` or `stopped`, then a sync-health line (see [Checking sync health](#checking-sync-health)). |
 | `claude-memsync run` | Run in the foreground (for debugging). |
 | `claude-memsync distill` | Rebuild the distilled-memory catalog index (`--prune`, `--dry-run`). See [distilling-memories.md](distilling-memories.md). |
 | `claude-memsync version` | Print version. |
@@ -143,7 +143,7 @@ and SSH keys. None require root.
                   ▼
 ~/.claudesync/projects/<key>/memory/       (mirror — git work-tree, keyed by fingerprint)
                   │
-                  │  git add -A, commit, pull --rebase, push
+                  │  git add -A, commit, pull (merge), resolve conflicts, push
                   ▼
                 <remote>                   (private GitHub repo)
                   │
@@ -213,9 +213,56 @@ commits.
   `git pull` are written back atomically.
 - The custom merge driver is registered in the local repo config and invoked by
   git via `.gitattributes` (`MEMORY.md merge=claude-memory-index`).
-- Conflicts in non-`MEMORY.md` files surface as standard git conflict markers in
-  the affected file. Rare in practice because each memory file has a unique
-  filename per topic.
+- The pull always **merges** (`git pull --no-rebase`), so a conflict is met
+  once, however many local commits are waiting. See
+  [Conflicts](#conflicts) for how each kind is settled.
+
+## Conflicts
+
+When a pull hits a conflict, the daemon settles every conflicted file itself,
+commits the merge and pushes. A conflict never leaves the sync repo stuck, and
+never leaves conflict markers in a file.
+
+| Conflict | Result |
+|---|---|
+| `MEMORY.md`, both PCs edited it | Merged section by section. Where both edited the same lines, **both versions are kept** (this PC's first). Done in-process, so it works even if the merge driver isn't configured. |
+| Other memory file, both PCs edited it | The frontmatter `modified:` timestamp (top-level or under `metadata:`) is set to the newer of the two on every version first, so the timestamp alone never conflicts. If the edits don't overlap, they merge cleanly with **no backup**. Otherwise the side with the **newer `modified:` wins** each overlapping section (the other side's non-overlapping edits are kept); if either side has no timestamp, or they're equal, **this PC wins**. |
+| Both PCs created a file with the same name | Same as above, with an empty common ancestor. |
+| Edited on one PC, deleted on the other | The edited copy is kept (an edit outranks a delete). |
+
+Whenever one side's version loses, its original is saved next to the file in
+the mirror as `<name>.from-remote-<random>` (in
+`~/.claudesync/projects/<key>/memory/`). Backups are git-ignored: they stay on
+the PC that did the merge for you to review, and are never synced or copied
+into `~/.claude/projects`. The daemon log names each resolved file and backup.
+
+If resolving fails for any reason, the merge is aborted (the repo goes back to
+its pre-pull state, local commits intact), the failure is recorded, and the
+next sync tries again. An older daemon that stopped mid-rebase or mid-merge is
+cleaned up the same way at startup.
+
+## Checking sync health
+
+`claude-memsync status` prints a second line about how syncing is going,
+from `~/.claudesync/.state/health.json` and the local copy of origin's branch
+(it makes no network call):
+
+```
+running (pid 12345)
+sync: ok — last synced 2026-11-24 17:50 (up to date with origin)
+```
+
+```
+running (pid 12345)
+sync: FAILING — 412 consecutive failures since 2026-08-19 17:01 (ahead 231, behind 360)
+  last success: 2026-08-19 16:00
+  last error: pull: git pull …: …
+```
+
+"Last synced" is the last time the daemon confirmed this PC matches origin
+(an idle check counts). A failure is any sync that couldn't finish: origin
+unreachable, push rejected, a conflict that couldn't be resolved. The exit code
+of `status` stays 0 either way, so existing scripts keep working.
 
 ## What gets synced (and what doesn't)
 
@@ -232,6 +279,8 @@ commits.
 - `~/.claudesync/.state/manifest.json` — per-PC (delete-detection state)
 - `~/.claudesync/.state/index.json` — per-PC (localHash → fingerprint key map)
 - `~/.claudesync/.state/migrated.json` — per-PC (legacy files already imported)
+- `~/.claudesync/.state/health.json` — per-PC (sync health for `status`)
+- `.from-remote-*` conflict backups — per-PC, for review
 - `~/.claudesync/daemon.pid` — runtime state
 - `~/.claudesync/distilled/DISTILLED.md` — derived index, regenerated per-PC
   (the distilled `<slug>.md` entry files themselves **are** synced)
@@ -275,6 +324,7 @@ This means:
     ├── .state/manifest.json              # per-PC delete-detection state
     ├── .state/index.json                 # per-PC localHash → fingerprint key map
     ├── .state/migrated.json              # per-PC record of imported legacy files
+    ├── .state/health.json                # per-PC sync health, read by `status`
     ├── distilled/                        # shared distilled-memory catalog
     │   ├── DISTILLED.md                  # derived index (gitignored)
     │   └── <slug>.md ...                 # distilled entries (synced)
@@ -331,10 +381,11 @@ If that works without prompting, the daemon will too.
   root commit, so a remote-less shallow repo falls back to the path key. A repo
   whose `origin` URL is later changed (renamed org, new host) re-keys — the next
   time that project is used — and re-merges under the new key.
-- **No live conflict UI**: when the merge driver emits actual conflict markers
-  (rare; only on overlapping line edits within the same `MEMORY.md` section
-  body), the file is committed and pushed with markers. The next time you edit on
-  that PC you'll see them; resolve by hand and save.
+- **Conflicts are settled automatically, not interactively**: there's no prompt
+  when two PCs edit the same lines. `MEMORY.md` keeps both versions (you may
+  want to tidy duplicated lines); other files keep the newer version and save
+  the other as a `.from-remote-*` backup on the PC that merged. Review backups
+  now and then and delete them when done.
 - **Auto-start runs while logged in**: the daemon stops when the user logs off.
   Acceptable since memories don't change while you're away. For 24/7 sync,
   register a system-wide service manually or enable systemd lingering.

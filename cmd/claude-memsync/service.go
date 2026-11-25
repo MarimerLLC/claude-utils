@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kardianos/service"
 
 	"github.com/MarimerLLC/claude-utils/internal/config"
+	"github.com/MarimerLLC/claude-utils/internal/gitwt"
 	syncpkg "github.com/MarimerLLC/claude-utils/internal/sync"
 )
 
@@ -168,7 +170,30 @@ func runStatus(args []string) int {
 		return 1
 	}
 	fmt.Println(st)
+	if line := syncHealthLine(defaultConfigPath()); line != "" {
+		fmt.Println(line)
+	}
 	return 0
+}
+
+// syncHealthLine reports how the daemon's syncs are going, from the health
+// file it writes and the local copy of origin's branch (no network call).
+// Empty when there's no config yet. The exit code of `status` never depends
+// on it, so scripts that check only the daemon keep working.
+func syncHealthLine(configPath string) string {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return ""
+	}
+	h, err := syncpkg.LoadHealth(cfg.SyncDir)
+	if err != nil {
+		return "sync: health record unreadable: " + err.Error()
+	}
+	ahead, behind, err := gitwt.New(cfg.SyncDir).AheadBehind("main")
+	if err != nil {
+		ahead, behind = -1, -1
+	}
+	return syncpkg.FormatHealth(h, ahead, behind, time.Local)
 }
 
 // runService is the entry point for `claude-memsync run`. It wraps the loop

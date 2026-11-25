@@ -180,15 +180,18 @@ func TestMerge_SameDuplicateAddedOnBothSides(t *testing.T) {
 }
 
 // When both sides change the copies so no copy anchors the alignment, the
-// overlap must surface as a conflict rather than disappear.
-func TestMerge_DuplicatesBothChangedSurfaceConflict(t *testing.T) {
+// overlap must keep both texts rather than lose either one.
+func TestMerge_DuplicatesBothChangedKeepBoth(t *testing.T) {
 	base := "## Notes\na\n\n## Notes\nb\n"
 	ours := "## Notes\na edited\n\n## Notes\nb\n"
 	theirs := "## Notes\nb edited\n"
 
 	got, conflict := Merge(base, ours, theirs)
-	if !conflict {
-		t.Fatalf("expected a conflict, got %q", got)
+	if conflict {
+		t.Fatalf("both changes should be kept without a conflict, got %q", got)
+	}
+	if strings.Contains(got, "<<<<<<<") {
+		t.Errorf("unexpected conflict markers: %q", got)
 	}
 	for _, want := range []string{"a edited", "b edited"} {
 		if !strings.Contains(got, want) {
@@ -303,17 +306,27 @@ func TestMerge_ConcurrentBodyEdits_NonOverlapping(t *testing.T) {
 	}
 }
 
+// Overlapping edits to one line keep both versions (ours first) and never
+// leave conflict markers in MEMORY.md.
 func TestMerge_ConcurrentBodyEdits_Conflicting(t *testing.T) {
 	base := "## Deploy\nstep1\n"
 	ours := "## Deploy\nstep1-PC1\n"
 	theirs := "## Deploy\nstep1-PC2\n"
 
 	got, conflict := Merge(base, ours, theirs)
-	if !conflict {
-		t.Errorf("expected conflict for overlapping line edits; got=%q", got)
+	if conflict {
+		t.Errorf("overlapping line edits should keep both versions, not conflict; got=%q", got)
 	}
-	if !strings.Contains(got, "<<<<<<<") {
-		t.Errorf("expected conflict markers in output: %q", got)
+	for _, marker := range []string{"<<<<<<<", "=======", ">>>>>>>"} {
+		if strings.Contains(got, marker) {
+			t.Errorf("unexpected conflict marker %q in output: %q", marker, got)
+		}
+	}
+	if !strings.Contains(got, "step1-PC1") || !strings.Contains(got, "step1-PC2") {
+		t.Errorf("expected both versions kept: %q", got)
+	}
+	if strings.Index(got, "step1-PC1") > strings.Index(got, "step1-PC2") {
+		t.Errorf("expected ours before theirs: %q", got)
 	}
 }
 
