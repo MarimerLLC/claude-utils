@@ -52,8 +52,23 @@ type MigrateOptions struct {
 	// Prune deletes legacy files once imported (and their dirs once empty). Only
 	// safe once every PC syncing this repo runs a fingerprint-aware version: an
 	// older version reads the deletion as "user deleted these memories" and
-	// removes its local copies.
+	// removes its local copies. It first leaves a redirect (RedirectFileName)
+	// naming the key, which keeps the legacy dir itself.
 	Prune bool
+
+	// HadLegacy, if set, reports whether the sync repo's history ever held a
+	// legacy dir for localHash. With Prune, a fingerprinted project whose legacy
+	// dir is already gone (pruned by a version that left no redirect) gets a
+	// redirect written for it.
+	HadLegacy func(localHash string) bool
+}
+
+// HadLegacyIn returns a HadLegacy func backed by the sync repo's history.
+func HadLegacyIn(repo *gitwt.Repo) func(string) bool {
+	return func(localHash string) bool {
+		out, err := repo.Run("log", "--all", "-1", "--format=%H", "--", "projects/"+localHash+"/memory")
+		return err == nil && strings.TrimSpace(out) != ""
+	}
 }
 
 // PriorVersionFunc: see MigrateOptions.Prior.
@@ -116,7 +131,15 @@ func MigrateLayout(r Roots, idx *project.Index, opt MigrateOptions) (SyncReport,
 		oldMem := filepath.Join(oldProj, "memory")
 		entries, err := os.ReadDir(oldMem)
 		if errors.Is(err, fs.ErrNotExist) {
-			continue // nothing legacy to migrate for this project
+			// Nothing legacy to migrate. A legacy dir pruned before redirects
+			// existed still gets one, so PCs keying it by path can follow.
+			if opt.Prune && opt.HadLegacy != nil && !hasRedirect(oldProj) && opt.HadLegacy(localHash) {
+				if err := writeRedirect(oldProj, entry.Key); err != nil {
+					return rep, err
+				}
+				rep.Redirected = append(rep.Redirected, localHash)
+			}
+			continue
 		}
 		if err != nil {
 			return rep, err
@@ -142,61 +165,18 @@ func MigrateLayout(r Roots, idx *project.Index, opt MigrateOptions) (SyncReport,
 			}
 
 			newPath := filepath.Join(newMem, name)
-			newExists, newBytes := readIfExists(newPath)
-			switch {
-			case isCollisionBackup(name):
+			if isCollisionBackup(name) {
 				// A .from-remote-* recovery copy is not a memory: never merge or
 				// re-back it up. Carry it over verbatim (names are unique) so it
 				// stays recoverable under the key — pruning removes the legacy
 				// copy only after this one exists.
-				if !newExists {
+				if newExists, _ := readIfExists(newPath); !newExists {
 					if err := writeFile(newPath, oldBytes); err != nil {
 						return rep, err
 					}
 				}
-			case newExists && bytes.Equal(oldBytes, newBytes):
-				// identical — nothing to do
-			case opt.Prior != nil && opt.Prior(rel, oldBytes):
-				// stale: the key's file already held this version and moved on
-			case !newExists:
-				if err := writeFile(newPath, oldBytes); err != nil {
-					return rep, err
-				}
-				rep.CopiedToMirror = append(rep.CopiedToMirror, rel)
-			case name == "MEMORY.md":
-				var base []byte
-				if opt.Base != nil {
-					base = opt.Base(legacyRel, rel)
-				}
-				merged, _ := merge.Merge(string(base), string(newBytes), string(oldBytes))
-				if err := writeFile(newPath, []byte(merged)); err != nil {
-					return rep, err
-				}
-				rep.Merged = append(rep.Merged, rel)
-			default:
-				// Both exist and differ: merge them as a pull would, with the
-				// key's file as "ours" and the legacy copy as "theirs". Only an
-				// overlapping edit has a loser, and its original is kept as a
-				// backup next to the key's file.
-				var base []byte
-				if opt.Base != nil {
-					base = opt.Base(legacyRel, rel)
-				}
-				legacyLater := opt.LegacyLater != nil && opt.LegacyLater(legacyRel, rel)
-				res := resolveText(base, newBytes, oldBytes, legacyLater)
-				if !bytes.Equal(res.content, newBytes) {
-					if err := writeFile(newPath, res.content); err != nil {
-						return rep, err
-					}
-					rep.Merged = append(rep.Merged, rel)
-				}
-				if res.loser != nil {
-					backup := fmt.Sprintf("%s.from-remote-%s", newPath, randSuffix())
-					if err := writeFile(backup, res.loser); err != nil {
-						return rep, err
-					}
-					rep.BackedUp = append(rep.BackedUp, rel)
-				}
+			} else if err := importVersion(newPath, oldBytes, legacyRel, rel, opt, &rep); err != nil {
+				return rep, err
 			}
 			if opt.State != nil {
 				opt.State.Record(legacyRel, sum)
@@ -205,6 +185,16 @@ func MigrateLayout(r Roots, idx *project.Index, opt MigrateOptions) (SyncReport,
 		}
 
 		if opt.Prune {
+			// Leave a redirect first, so a PC that still keys this project by
+			// path follows it to the key instead of reading the removal below as
+			// the user deleting these memories (see RedirectFileName). It keeps
+			// the legacy dir itself in place.
+			if !hasRedirect(oldProj) {
+				if err := writeRedirect(oldProj, entry.Key); err != nil {
+					return rep, err
+				}
+				rep.Redirected = append(rep.Redirected, localHash)
+			}
 			// Remove only what was imported; anything skipped above (subdirs,
 			// dot-files) stays, and with it the dir.
 			for _, name := range imported {
@@ -222,6 +212,61 @@ func MigrateLayout(r Roots, idx *project.Index, opt MigrateOptions) (SyncReport,
 		}
 	}
 	return rep, nil
+}
+
+// importVersion folds one version of a memory file, last synced as oldRel (a
+// legacy dir, or the key a re-keyed project used before), into the key's copy at
+// newPath (rel). The key's file is "ours" and the incoming version "theirs":
+//
+//   - identical, or a version the key already held and moved past: no change;
+//   - absent from the key: copied in;
+//   - MEMORY.md: merged section by section against their shared version;
+//   - otherwise merged 3-way as a pull would. Only an overlapping edit has a
+//     loser, and its original is kept as <name>.from-remote-<random>.
+func importVersion(newPath string, oldBytes []byte, oldRel, rel string, opt MigrateOptions, rep *SyncReport) error {
+	newExists, newBytes := readIfExists(newPath)
+	switch {
+	case newExists && bytes.Equal(oldBytes, newBytes):
+		// identical — nothing to do
+	case opt.Prior != nil && opt.Prior(rel, oldBytes):
+		// stale: the key's file already held this version and moved on
+	case !newExists:
+		if err := writeFile(newPath, oldBytes); err != nil {
+			return err
+		}
+		rep.CopiedToMirror = append(rep.CopiedToMirror, rel)
+	case filepath.Base(newPath) == "MEMORY.md":
+		var base []byte
+		if opt.Base != nil {
+			base = opt.Base(oldRel, rel)
+		}
+		merged, _ := merge.Merge(string(base), string(newBytes), string(oldBytes))
+		if err := writeFile(newPath, []byte(merged)); err != nil {
+			return err
+		}
+		rep.Merged = append(rep.Merged, rel)
+	default:
+		var base []byte
+		if opt.Base != nil {
+			base = opt.Base(oldRel, rel)
+		}
+		later := opt.LegacyLater != nil && opt.LegacyLater(oldRel, rel)
+		res := resolveText(base, newBytes, oldBytes, later)
+		if !bytes.Equal(res.content, newBytes) {
+			if err := writeFile(newPath, res.content); err != nil {
+				return err
+			}
+			rep.Merged = append(rep.Merged, rel)
+		}
+		if res.loser != nil {
+			backup := fmt.Sprintf("%s.from-remote-%s", newPath, randSuffix())
+			if err := writeFile(backup, res.loser); err != nil {
+				return err
+			}
+			rep.BackedUp = append(rep.BackedUp, rel)
+		}
+	}
+	return nil
 }
 
 // isCollisionBackup reports whether name is a .from-remote-* backup written on

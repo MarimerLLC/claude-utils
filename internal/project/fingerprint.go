@@ -18,6 +18,9 @@ const (
 	MethodRemote Method = "remote" // normalized origin remote URL (preferred)
 	MethodRoot   Method = "root"   // git root-commit SHA (git repo, no remote)
 	MethodPath   Method = "path"   // fallback: Claude's dash-encoded dir name
+	// MethodMoved: a path-keyed project following the redirect another PC left
+	// when it pruned the project's legacy mirror dir (see sync.FollowRedirects).
+	MethodMoved Method = "moved"
 )
 
 // Key prefixes distinguish fingerprint keys from legacy path keys (which start

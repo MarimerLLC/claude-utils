@@ -46,6 +46,8 @@ type SyncReport struct {
 	RemovedFromMirror []string // user-deleted files removed from mirror (manifest-detected)
 	RemovedFromClaude []string // files removed from sibling checkouts of a deleted-in-one project
 	PrunedLegacy      []string // legacy path-keyed mirror files removed after import
+	Redirected        []string // legacy dirs given a moved-to redirect when pruned
+	Errors            []string // per-project failures that were skipped (AdoptRekeyed)
 }
 
 // ErrNeedsReconcile is returned by the incremental helpers (CopyToMirror,
@@ -115,14 +117,16 @@ func Reconcile(r Roots, idx *project.Index, manifest *Manifest) (SyncReport, err
 	//     a now-fingerprinted project. MigrateLayout imports it; writing to it
 	//     would revive it as a second, permanently diverging copy;
 	//   - names of local projects missing from the index: still pending a cwd,
-	//     their key isn't known yet.
+	//     their key isn't known yet;
+	//   - pruned legacy dirs that only hold a redirect (FollowRedirects handles
+	//     any local project they belong to).
 	mirrorEntries, err := os.ReadDir(r.Mirror)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return rep, fmt.Errorf("read mirror %s: %w", r.Mirror, err)
 	}
 	for _, e := range mirrorEntries {
 		name := e.Name()
-		if !e.IsDir() || project.IsFingerprintKey(name) {
+		if !e.IsDir() || project.IsFingerprintKey(name) || hasRedirect(filepath.Join(r.Mirror, name)) {
 			continue
 		}
 		if _, ok := groups[name]; ok {
