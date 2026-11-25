@@ -128,7 +128,7 @@ and SSH keys. None require root.
 | `claude-memsync uninstall` | Remove the auto-start hook. |
 | `claude-memsync start` | Start the daemon now. |
 | `claude-memsync stop` | Stop the running daemon. |
-| `claude-memsync status` | Print `running (pid N)` or `stopped`, then a sync-health line (see [Checking sync health](#checking-sync-health)). |
+| `claude-memsync status [--config <path>]` | Print `running (pid N)` or `stopped`, then a sync-health line (see [Checking sync health](#checking-sync-health)). |
 | `claude-memsync run` | Run in the foreground (for debugging). |
 | `claude-memsync distill` | Rebuild the distilled-memory catalog index (`--prune`, `--dry-run`). See [distilling-memories.md](distilling-memories.md). |
 | `claude-memsync version` | Print version. |
@@ -228,18 +228,24 @@ never leaves conflict markers in a file.
 | `MEMORY.md`, both PCs edited it | Merged section by section. Where both edited the same lines, **both versions are kept** (this PC's first). Done in-process, so it works even if the merge driver isn't configured. |
 | Other memory file, both PCs edited it | The frontmatter `modified:` timestamp (top-level or under `metadata:`) is set to the newer of the two on every version first, so the timestamp alone never conflicts. If the edits don't overlap, they merge cleanly with **no backup**. Otherwise the side with the **newer `modified:` wins** each overlapping section (the other side's non-overlapping edits are kept); if either side has no timestamp, or they're equal, **this PC wins**. |
 | Both PCs created a file with the same name | Same as above, with an empty common ancestor. |
+| Binary file (contains a NUL byte), both PCs edited it | Can't be merged by line: the winner, chosen by the same timestamp rule, is kept as a whole file. |
 | Edited on one PC, deleted on the other | The edited copy is kept (an edit outranks a delete). |
+| Renamed differently on each PC | Both new names are kept; the old name is removed. |
 
 Whenever one side's version loses, its original is saved next to the file in
 the mirror as `<name>.from-remote-<random>` (in
-`~/.claudesync/projects/<key>/memory/`). Backups are git-ignored: they stay on
-the PC that did the merge for you to review, and are never synced or copied
-into `~/.claude/projects`. The daemon log names each resolved file and backup.
+`~/.claudesync/projects/<key>/memory/`), once the merge is committed.
+Backups are git-ignored: they stay on the PC that did the merge for you to
+review, and are never synced or copied into `~/.claude/projects`. The daemon
+log names each resolved file and backup.
 
 If resolving fails for any reason, the merge is aborted (the repo goes back to
 its pre-pull state, local commits intact), the failure is recorded, and the
-next sync tries again. An older daemon that stopped mid-rebase or mid-merge is
-cleaned up the same way at startup.
+next sync tries again. A merge or rebase left half-done (by an older daemon
+that stopped mid-sync, or by hand) is aborted the same way at startup and
+before every sync. If it can't be aborted (a stale `.git/index.lock`, say),
+the daemon stages and commits nothing until it can, and `status` shows the
+failure.
 
 ## Checking sync health
 
@@ -259,9 +265,13 @@ sync: FAILING — 412 consecutive failures since 2026-08-19 17:01 (ahead 231, be
   last error: pull: git pull …: …
 ```
 
+If the daemon was installed with `install --config <path>`, pass the same
+`--config <path>` to `status`; otherwise it reads `~/.claudesync/config.json`.
+
 "Last synced" is the last time the daemon confirmed this PC matches origin
 (an idle check counts). A failure is any sync that couldn't finish: origin
-unreachable, push rejected, a conflict that couldn't be resolved. The exit code
+unreachable, push rejected, a conflict that couldn't be resolved, or local
+memories that couldn't be copied into the mirror. The exit code
 of `status` stays 0 either way, so existing scripts keep working.
 
 ## What gets synced (and what doesn't)

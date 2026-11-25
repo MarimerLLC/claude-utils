@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -348,7 +349,7 @@ func TestFlush_ResolvesConflictAndTracksHealth(t *testing.T) {
 
 	l := testLoop(b)
 	roots := Roots{Claude: t.TempDir(), Mirror: filepath.Join(b.Dir, "projects")}
-	if err := l.flush(b, roots, true); err != nil {
+	if err := l.flush(b, roots, true, nil); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	if remote, _ := b.LsRemoteHead("main"); remote != revParse(t, b, "HEAD") {
@@ -364,11 +365,11 @@ func TestFlush_ResolvesConflictAndTracksHealth(t *testing.T) {
 
 	// Origin unreachable: failures accumulate, FirstFailure stays put.
 	mustGit(t, b, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "missing.git"))
-	if err := l.flush(b, roots, true); err == nil {
+	if err := l.flush(b, roots, true, nil); err == nil {
 		t.Fatal("flush against a missing origin should fail")
 	}
 	h1, _ := LoadHealth(b.Dir)
-	if err := l.flush(b, roots, true); err == nil {
+	if err := l.flush(b, roots, true, nil); err == nil {
 		t.Fatal("flush against a missing origin should fail")
 	}
 	h2, _ := LoadHealth(b.Dir)
@@ -384,7 +385,7 @@ func TestFlush_ResolvesConflictAndTracksHealth(t *testing.T) {
 
 	// Recovery resets the run.
 	mustGit(t, b, "remote", "set-url", "origin", origin)
-	if err := l.flush(b, roots, true); err != nil {
+	if err := l.flush(b, roots, true, nil); err != nil {
 		t.Fatalf("flush after recovery: %v", err)
 	}
 	h3, _ := LoadHealth(b.Dir)
@@ -408,6 +409,9 @@ func TestModifiedOf(t *testing.T) {
 		{"no frontmatter", "modified: 2026-11-21T10:00:00Z\n", "", false},
 		{"unclosed", "---\nmodified: 2026-11-21T10:00:00Z\nbody\n", "", false},
 		{"unparseable", "---\nmodified: yesterday\n---\n", "yesterday", false},
+		{"trailing comment", "---\nmodified: 2026-11-21T10:00:00Z # moved\n---\n", "2026-11-21T10:00:00Z", true},
+		{"quoted with comment", "---\nmodified: '2026-11-21T10:00:00Z'  # x\n---\n", "'2026-11-21T10:00:00Z'", true},
+		{"hash inside value", "---\nmodified: 2026#11\n---\n", "2026#11", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -425,6 +429,10 @@ func TestSetModified(t *testing.T) {
 	if got := string(setModified([]byte(in), "2026-11-22T10:00:00Z")); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
+	commented := "---\nmodified: 2026-11-20T10:00:00Z # moved\n---\n"
+	if got := string(setModified([]byte(commented), "2026-11-22T10:00:00Z")); got != "---\nmodified: 2026-11-22T10:00:00Z # moved\n---\n" {
+		t.Fatalf("comment should survive the rewrite: %q", got)
+	}
 	plain := "no frontmatter\n"
 	if got := string(setModified([]byte(plain), "x")); got != plain {
 		t.Fatalf("content without the key must be unchanged: %q", got)
@@ -438,10 +446,7 @@ func TestResolveText_TiesGoToThisPC(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ours := []byte(note(t1, "a\nb-ours\nc\n"))
 			theirs := []byte(note(theirsStamp, "a\nb-theirs\nc\n"))
-			r, err := resolveText(base, ours, theirs)
-			if err != nil {
-				t.Fatal(err)
-			}
+			r := resolveText(base, ours, theirs)
 			if !strings.Contains(string(r.content), "b-ours") || strings.Contains(string(r.content), "b-theirs") {
 				t.Fatalf("this PC should win: %q", r.content)
 			}
@@ -449,5 +454,202 @@ func TestResolveText_TiesGoToThisPC(t *testing.T) {
 				t.Fatalf("loser should be theirs' original: %q", r.loser)
 			}
 		})
+	}
+}
+
+// Binary content can't go through git merge-file (it exits 255): the winner
+// is taken whole instead of aborting the merge, so the PC can't wedge.
+func TestResolve_BinaryConflictTakesWholeFile(t *testing.T) {
+	_, a, b := conflictFixture(t)
+	const rel = "projects/k/memory/blob.bin"
+	commitAt(t, a, rel, "a\x00base\n", true)
+	mustPull(t, b)
+
+	commitAt(t, a, rel, "a\x00theirs\n", true)
+	commitAt(t, b, rel, "a\x00ours\n", false)
+
+	mustPull(t, b)
+	if got := readAt(t, b, rel); got != "a\x00ours\n" {
+		t.Fatalf("this PC's whole file should win: %q", got)
+	}
+	bk := backupsOf(t, b, rel)
+	if len(bk) != 1 {
+		t.Fatalf("want one backup, got %v", bk)
+	}
+	if got, _ := os.ReadFile(bk[0]); string(got) != "a\x00theirs\n" {
+		t.Fatalf("backup should hold origin's version: %q", got)
+	}
+	if err := b.Push("main"); err != nil {
+		t.Fatalf("push after merge: %v", err)
+	}
+}
+
+// A merge that is aborted (here: the commit is refused by a hook) must not
+// leave backups behind; they are written only once the merge is committed.
+func TestPull_AbortedMergeWritesNoBackup(t *testing.T) {
+	_, a, b := conflictFixture(t)
+	const rel = "projects/k/memory/plain.md"
+	commitAt(t, a, rel, "a\nb\nc\n", true)
+	mustPull(t, b)
+	commitAt(t, a, rel, "a\nb-theirs\nc\n", true)
+	commitAt(t, b, rel, "a\nb-ours\nc\n", false)
+
+	out, err := b.Run("rev-parse", "--git-path", "hooks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooks := strings.TrimSpace(out)
+	if !filepath.IsAbs(hooks) {
+		hooks = filepath.Join(b.Dir, hooks)
+	}
+	hook := filepath.Join(hooks, "pre-commit")
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ { // retried, as the loop would every tick
+		if err := testLoop(b).pull(b); err == nil {
+			t.Fatal("pull should fail when the merge commit is refused")
+		}
+		if b.MergeInProgress() {
+			t.Fatal("merge should be aborted")
+		}
+		if bk := backupsOf(t, b, rel); len(bk) != 0 {
+			t.Fatalf("aborted merge left backups: %v", bk)
+		}
+	}
+
+	if err := os.Remove(hook); err != nil {
+		t.Fatal(err)
+	}
+	mustPull(t, b)
+	if bk := backupsOf(t, b, rel); len(bk) != 1 {
+		t.Fatalf("want one backup after the merge commits, got %v", bk)
+	}
+}
+
+// A rename/rename leaves the original path with only a base stage (deleted on
+// both sides). Its name has glob characters: removing it must not drop a
+// file the glob would also match (n1.md) from the merge.
+func TestResolve_RenameRenameLiteralPath(t *testing.T) {
+	_, a, b := conflictFixture(t)
+	const dir = "projects/k/memory/"
+	writeAt(t, a, dir+"n[12].md", "x\n")
+	commitAt(t, a, dir+"n1.md", "one\n", true)
+	mustPull(t, b)
+
+	mustGit(t, a, "mv", dir+"n[12].md", dir+"ra.md")
+	commitAll(t, a, "rename on a")
+	mustGit(t, a, "push", "-q", "origin", "main")
+	mustGit(t, b, "mv", dir+"n[12].md", dir+"rb.md")
+	commitAll(t, b, "rename on b")
+
+	mustPull(t, b)
+	for _, name := range []string{"n1.md", "ra.md", "rb.md"} {
+		if _, err := b.Run("cat-file", "-e", "HEAD:"+dir+name); err != nil {
+			t.Errorf("%s missing from the merge: %v", name, err)
+		}
+	}
+	if _, err := b.Run("cat-file", "-e", "HEAD:"+dir+"n[12].md"); err == nil {
+		t.Error("n[12].md should be gone (renamed on both sides)")
+	}
+	if got := readAt(t, b, dir+"n1.md"); got != "one\n" {
+		t.Errorf("n1.md changed: %q", got)
+	}
+	if err := b.Push("main"); err != nil {
+		t.Fatalf("push after merge: %v", err)
+	}
+}
+
+// A trailing YAML comment doesn't hide the timestamp: the newer side wins.
+func TestResolveText_TimestampWithComment(t *testing.T) {
+	base := []byte("---\nmodified: 2026-11-20T10:00:00Z\n---\na\nb\nc\n")
+	ours := []byte("---\nmodified: 2026-11-21T10:00:00Z\n---\na\nb-ours\nc\n")
+	theirs := []byte("---\nmodified: 2026-11-22T10:00:00Z # moved\n---\na\nb-theirs\nc\n")
+	r := resolveText(base, ours, theirs)
+	if string(r.content) != string(theirs) {
+		t.Fatalf("newer (commented) side should win:\n got %q\nwant %q", r.content, theirs)
+	}
+	if string(r.loser) != string(ours) {
+		t.Fatalf("loser should be ours: %q", r.loser)
+	}
+}
+
+// A merge left half-done (and, here, impossible to abort because of a stale
+// index.lock) must never be staged and committed with its conflict markers.
+// The sync refuses until the reset works, then recovers.
+func TestFlush_RefusesToStageMidMerge(t *testing.T) {
+	_, a, b := conflictFixture(t)
+	const rel = "projects/k/memory/plain.md"
+	commitAt(t, a, rel, "a\nb\nc\n", true)
+	mustPull(t, b)
+	commitAt(t, a, rel, "a\nb-theirs\nc\n", true)
+	commitAt(t, b, rel, "a\nb-ours\nc\n", false)
+	if err := b.Pull("main"); err == nil || !b.MergeInProgress() {
+		t.Fatalf("expected the raw pull to stop mid-merge (err=%v)", err)
+	}
+	before := revParse(t, b, "HEAD")
+
+	out, err := b.Run("rev-parse", "--git-path", "index.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := strings.TrimSpace(out)
+	if !filepath.IsAbs(lock) {
+		lock = filepath.Join(b.Dir, lock)
+	}
+	if err := os.WriteFile(lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	l := testLoop(b)
+	roots := Roots{Claude: t.TempDir(), Mirror: filepath.Join(b.Dir, "projects")}
+	if err := l.flush(b, roots, true, nil); err == nil {
+		t.Fatal("flush must fail while the merge can't be reset")
+	}
+	if got := revParse(t, b, "HEAD"); got != before {
+		t.Fatalf("HEAD moved from %s to %s: something was committed mid-merge", before, got)
+	}
+	if h, _ := LoadHealth(b.Dir); h.ConsecutiveFailures != 1 {
+		t.Fatalf("failure not recorded: %+v", h)
+	}
+
+	if err := os.Remove(lock); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.flush(b, roots, true, nil); err != nil {
+		t.Fatalf("flush after the lock is gone: %v", err)
+	}
+	got := readAt(t, b, rel)
+	assertNoMarkers(t, got)
+	if got != "a\nb-ours\nc\n" {
+		t.Fatalf("this PC should win after recovery: %q", got)
+	}
+	if remote, _ := b.LsRemoteHead("main"); remote != revParse(t, b, "HEAD") {
+		t.Fatal("origin != HEAD after recovery")
+	}
+}
+
+// A Reconcile failure earlier in the tick makes the tick a failure even when
+// the git phase is idle, so status can't report ok while memories go unsynced.
+func TestFlush_RecordsPriorError(t *testing.T) {
+	_, _, b := conflictFixture(t)
+	l := testLoop(b)
+	roots := Roots{Claude: t.TempDir(), Mirror: filepath.Join(b.Dir, "projects")}
+	if err := l.flush(b, roots, true, errors.New("reconcile: boom")); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("flush should return the prior error, got %v", err)
+	}
+	h, _ := LoadHealth(b.Dir)
+	if h.ConsecutiveFailures != 1 || !strings.Contains(h.LastError, "boom") {
+		t.Fatalf("prior error not recorded: %+v", h)
+	}
+	if err := l.flush(b, roots, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := LoadHealth(b.Dir); h.ConsecutiveFailures != 0 {
+		t.Fatalf("clean tick should reset: %+v", h)
 	}
 }

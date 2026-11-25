@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path"
@@ -14,9 +15,34 @@ import (
 
 // Resolution describes how resolveConflicts settled a stopped merge.
 type Resolution struct {
-	Files   []ResolvedFile
-	Backups []string // repo-relative paths of .from-remote-* copies written
+	Files []ResolvedFile
+	// Backups are the losing versions to keep as .from-remote-* copies. They
+	// are not written by resolveConflicts: the caller writes them (see
+	// WriteBackups) only once the merge is committed, so an aborted merge
+	// that is retried every tick leaves nothing behind.
+	Backups []Backup
 }
+
+// Backup is one losing version to save next to its file.
+type Backup struct {
+	Path    string // repo-relative, slash-separated, including the .from-remote-* suffix
+	Content []byte
+}
+
+// WriteBackups writes the backups under the work-tree at dir.
+func (r Resolution) WriteBackups(dir string) error {
+	for _, b := range r.Backups {
+		if err := writeFile(filepath.Join(dir, filepath.FromSlash(b.Path)), b.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// literal turns a repo-relative path into a pathspec that matches only that
+// path: without it, *, ? and [...] in a file name act as glob characters,
+// and `git rm --cached` could drop unrelated files from the merge.
+func literal(p string) string { return ":(literal)" + p }
 
 // ResolvedFile is one conflicted path and how it was settled.
 type ResolvedFile struct {
@@ -31,7 +57,11 @@ func (r Resolution) String() string {
 	}
 	s := strings.Join(parts, ", ")
 	if len(r.Backups) > 0 {
-		s += "; backups: " + strings.Join(r.Backups, ", ")
+		names := make([]string, len(r.Backups))
+		for i, b := range r.Backups {
+			names[i] = b.Path
+		}
+		s += "; backups: " + strings.Join(names, ", ")
 	}
 	return s
 }
@@ -44,13 +74,19 @@ func (r Resolution) String() string {
 //     keeps both versions of overlapping edits, so it never leaves markers and
 //     doesn't depend on the merge driver being configured.
 //   - Any other file both sides changed (or both added): see resolveText. The
-//     losing side's original version, if one had to lose, is written next to
-//     the file as <name>.from-remote-<random>. Backups are git-ignored, so
-//     they stay on this PC for the user to review.
+//     losing side's original version, if one had to lose, is returned in
+//     Backups, for the caller to write next to the file as
+//     <name>.from-remote-<random> once the merge is committed. Backups are
+//     git-ignored, so they stay on this PC for the user to review.
 //   - A file one side changed and the other deleted: the changed copy is
-//     kept, the same rule Reconcile uses (an edit outranks a delete).
+//     kept, the same rule Reconcile uses (an edit outranks a delete). A file
+//     that collided with a directory arrives this way too: git moves it aside
+//     to <name>~<side>, and it is kept under that name.
+//   - A path only the base has (deleted on both sides, e.g. a rename/rename):
+//     removed.
 //
-// On error nothing is guaranteed about the index; the caller aborts the merge.
+// Paths are passed to git as literal pathspecs. On error nothing is
+// guaranteed about the index; the caller aborts the merge.
 func resolveConflicts(repo *gitwt.Repo) (Resolution, error) {
 	var res Resolution
 	entries, err := repo.UnmergedEntries()
@@ -85,23 +121,16 @@ func resolveConflicts(repo *gitwt.Repo) (Resolution, error) {
 				}
 				out, how = []byte(merged), "MEMORY.md merge"
 			} else {
-				r, err := resolveText(base, ours, theirs)
-				if err != nil {
-					return res, fmt.Errorf("merge %s: %w", e.Path, err)
-				}
+				r := resolveText(base, ours, theirs)
 				out, loser, how = r.content, r.loser, r.how
 			}
 			if err := writeFile(abs, out); err != nil {
 				return res, err
 			}
 			if loser != nil {
-				suffix := ".from-remote-" + randSuffix()
-				if err := writeFile(abs+suffix, loser); err != nil {
-					return res, err
-				}
-				res.Backups = append(res.Backups, e.Path+suffix)
+				res.Backups = append(res.Backups, Backup{Path: e.Path + ".from-remote-" + randSuffix(), Content: loser})
 			}
-			if _, err := repo.Run("add", "--", e.Path); err != nil {
+			if _, err := repo.Run("add", "--", literal(e.Path)); err != nil {
 				return res, err
 			}
 			res.Files = append(res.Files, ResolvedFile{Path: e.Path, How: how})
@@ -119,7 +148,7 @@ func resolveConflicts(repo *gitwt.Repo) (Resolution, error) {
 			if err := writeFile(abs, content); err != nil {
 				return res, err
 			}
-			if _, err := repo.Run("add", "--", e.Path); err != nil {
+			if _, err := repo.Run("add", "--", literal(e.Path)); err != nil {
 				return res, err
 			}
 			res.Files = append(res.Files, ResolvedFile{Path: e.Path, How: how})
@@ -129,7 +158,7 @@ func resolveConflicts(repo *gitwt.Repo) (Resolution, error) {
 			if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
 				return res, err
 			}
-			if _, err := repo.Run("rm", "--cached", "--quiet", "--", e.Path); err != nil {
+			if _, err := repo.Run("rm", "--cached", "--quiet", "--", literal(e.Path)); err != nil {
 				return res, err
 			}
 			res.Files = append(res.Files, ResolvedFile{Path: e.Path, How: "deleted on both sides"})
@@ -161,13 +190,23 @@ type textResolution struct {
 //     (keeping the other side's non-overlapping changes); this PC wins when
 //     either side has no timestamp or they are equal. The loser's original,
 //     unmodified version is returned as the backup.
-func resolveText(base, ours, theirs []byte) (textResolution, error) {
+//
+// Binary content (a NUL byte, as git judges it) can't be merged line by line,
+// and neither can anything when `git merge-file` fails to run: then the
+// winner, chosen the same way, is taken as a whole file. resolveText never
+// fails, so no conflict of this kind can stop a merge from completing.
+func resolveText(base, ours, theirs []byte) textResolution {
 	rawO, tO, okO := modifiedOf(ours)
 	rawT, tT, okT := modifiedOf(theirs)
+	theirsNewer := okO && okT && tT.After(tO)
+
+	if isBinary(base) || isBinary(ours) || isBinary(theirs) {
+		return wholeFile(ours, theirs, theirsNewer, "binary")
+	}
 
 	newest := ""
 	switch {
-	case okO && okT && tT.After(tO):
+	case theirsNewer:
 		newest = rawT
 	case okO:
 		newest = rawO
@@ -181,21 +220,42 @@ func resolveText(base, ours, theirs []byte) (textResolution, error) {
 
 	out, conflicts, err := merge.MergeFile(b2, o2, t2, merge.FavorNone)
 	if err != nil {
-		return textResolution{}, err
+		return wholeFile(ours, theirs, theirsNewer, "merge-file failed")
 	}
 	if conflicts == 0 {
-		return textResolution{content: out, how: "merged"}, nil
+		return textResolution{content: out, how: "merged"}
 	}
 
 	favor, loser, how := merge.FavorOurs, theirs, "kept ours"
-	if okO && okT && tT.After(tO) {
+	if theirsNewer {
 		favor, loser, how = merge.FavorTheirs, ours, "kept theirs (newer)"
 	}
 	out, _, err = merge.MergeFile(b2, o2, t2, favor)
 	if err != nil {
-		return textResolution{}, err
+		return wholeFile(ours, theirs, theirsNewer, "merge-file failed")
 	}
-	return textResolution{content: out, loser: loser, how: how}, nil
+	return textResolution{content: out, loser: loser, how: how}
+}
+
+// wholeFile picks one side's complete version: theirs when it is newer,
+// otherwise ours. The other side is the backup unless the two are identical.
+func wholeFile(ours, theirs []byte, theirsNewer bool, why string) textResolution {
+	win, lose, how := ours, theirs, "kept ours whole ("+why+")"
+	if theirsNewer {
+		win, lose, how = theirs, ours, "kept theirs whole ("+why+", newer)"
+	}
+	if bytes.Equal(win, lose) {
+		lose = nil
+	}
+	return textResolution{content: win, loser: lose, how: how}
+}
+
+// isBinary applies git's own test: a NUL byte in the first 8000 bytes.
+func isBinary(b []byte) bool {
+	if len(b) > 8000 {
+		b = b[:8000]
+	}
+	return bytes.IndexByte(b, 0) >= 0
 }
 
 // modifiedOf returns the raw value of the frontmatter `modified:` key and its
@@ -259,14 +319,34 @@ func findModified(content []byte) (start, end int, ok bool) {
 			for vs < ve && (s[vs] == ' ' || s[vs] == '\t') {
 				vs++
 			}
-			for ve > vs && (s[ve-1] == ' ' || s[ve-1] == '\t') {
-				ve--
-			}
+			ve = valueEnd(s, vs, ve)
 			start, end, found = vs, ve, true
 		}
 		pos = next
 	}
 	return 0, 0, false // frontmatter never closed
+}
+
+// valueEnd returns where the YAML scalar starting at s[vs:ve] ends: after its
+// closing quote when quoted, else before a ` #` comment, without trailing
+// blanks. The comment is thus left out of the value and kept on rewrite.
+func valueEnd(s string, vs, ve int) int {
+	if vs < ve && (s[vs] == '"' || s[vs] == '\'') {
+		if j := strings.IndexByte(s[vs+1:ve], s[vs]); j >= 0 {
+			return vs + 1 + j + 1
+		}
+	} else {
+		for i := vs; i < ve; i++ {
+			if s[i] == '#' && i > vs && (s[i-1] == ' ' || s[i-1] == '\t') {
+				ve = i
+				break
+			}
+		}
+	}
+	for ve > vs && (s[ve-1] == ' ' || s[ve-1] == '\t') {
+		ve--
+	}
+	return ve
 }
 
 // nextLine returns the line starting at pos (without its '\n') and the

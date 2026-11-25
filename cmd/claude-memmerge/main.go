@@ -17,8 +17,11 @@ import (
 //   %L = conflict marker length (optional)
 //   %P = pathname of file in working tree (optional)
 //
-// Exit 0 = clean merge (file at %A path now contains merged result).
-// Exit non-zero = conflict; file at %A path may contain conflict markers.
+// Exit 0 = merged (file at %A path now contains the result). Overlapping edits
+// keep both versions, so the result never contains conflict markers.
+// Exit 1 = git could not be run to merge a section body; %A holds ours plus a
+// comment saying so, and git leaves the file conflicted.
+// Exit 2 = bad arguments or an unreadable/unwritable input file.
 //
 // See: https://git-scm.com/docs/gitattributes#_defining_a_custom_merge_driver
 
