@@ -407,3 +407,30 @@ kubectl context: rockbot-prod.
 		}
 	}
 }
+
+// Both sides changed one list section: this PC added an item, the other PC
+// updated an existing item's description. The update must survive — the list
+// union used to keep this PC's (unchanged, stale) line for every shared item.
+func TestMerge_ListItemEditedOnOneSideSurvives(t *testing.T) {
+	base := "# P\n\n## Notes\n- [Loss](loss.md) — measured\n- [Patrol](patrol.md) — narrowed\n"
+	ours := "# P\n\n## Notes\n- [Loss](loss.md) — measured\n- [Patrol](patrol.md) — narrowed\n- [New](new.md) — added here\n"
+	theirs := "# P\n\n## Notes\n- [Loss](loss.md) — FIXED in 0.14.10\n- [Patrol](patrol.md) — narrowed\n"
+
+	got, failed := Merge(base, ours, theirs)
+	if failed {
+		t.Fatal("merge failed")
+	}
+	if !strings.Contains(got, "FIXED in 0.14.10") || strings.Contains(got, "— measured") {
+		t.Errorf("the other side's edit was reverted:\n%s", got)
+	}
+	if !strings.Contains(got, "[New](new.md)") {
+		t.Errorf("this side's added item was lost:\n%s", got)
+	}
+
+	// Both sides edited the same item: this PC's line is kept (no base rule).
+	ours2 := strings.Replace(ours, "— measured", "— measured again", 1)
+	got2, _ := Merge(base, ours2, theirs)
+	if !strings.Contains(got2, "measured again") || strings.Contains(got2, "FIXED") {
+		t.Errorf("an item both sides edited should keep this PC's line:\n%s", got2)
+	}
+}

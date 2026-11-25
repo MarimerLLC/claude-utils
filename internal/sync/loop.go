@@ -570,9 +570,11 @@ func refreshMemoryWatches(w *fsnotify.Watcher, claudeRoot string) error {
 // them only when configured) and saves the import record. Best-effort.
 func (l *Loop) migrate(repo *gitwt.Repo, roots Roots) {
 	rep, err := MigrateLayout(roots, l.idx, MigrateOptions{
-		State: l.migState,
-		Prior: PriorVersionIn(repo),
-		Prune: l.Cfg.PruneLegacyDirs,
+		State:       l.migState,
+		Prior:       PriorVersionIn(repo),
+		Base:        SharedVersionIn(repo),
+		LegacyLater: ChangedLaterIn(repo),
+		Prune:       l.Cfg.PruneLegacyDirs,
 	})
 	if err != nil {
 		log.Println("migrate layout:", err)

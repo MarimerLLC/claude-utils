@@ -393,7 +393,7 @@ func blocksByKey(blocks []Block) map[string]Block {
 // fall back to `git merge-file`.
 func mergeBodies(base, ours, theirs string) (string, bool) {
 	if isListy(ours) && isListy(theirs) {
-		return mergeList(ours, theirs), false
+		return mergeList(base, ours, theirs), false
 	}
 	return mergeDiff3(base, ours, theirs)
 }
@@ -425,11 +425,27 @@ func listKey(line string) string {
 }
 
 // mergeList unions two list bodies, preserving the order from ours and
-// appending any items only in theirs.
-func mergeList(ours, theirs string) string {
+// appending any items only in theirs. An item both sides list keeps ours'
+// line, unless ours left it as it was in base and theirs edited it: then
+// theirs' edit is taken, so an updated description from the other PC isn't
+// reverted just because this PC touched a different item in the section.
+func mergeList(base, ours, theirs string) string {
+	lines := func(s string) map[string]string {
+		m := map[string]string{}
+		for _, l := range strings.Split(s, "\n") {
+			if t := strings.TrimSpace(l); t != "" {
+				if k := listKey(l); m[k] == "" {
+					m[k] = t
+				}
+			}
+		}
+		return m
+	}
+	baseLines, theirsLines := lines(base), lines(theirs)
+
 	seen := map[string]bool{}
 	var out []string
-	add := func(s string) {
+	add := func(s string, fromOurs bool) {
 		for _, l := range strings.Split(s, "\n") {
 			t := strings.TrimSpace(l)
 			if t == "" {
@@ -440,11 +456,18 @@ func mergeList(ours, theirs string) string {
 				continue
 			}
 			seen[k] = true
+			if fromOurs {
+				if b, inBase := baseLines[k]; inBase && b == t {
+					if th, inTheirs := theirsLines[k]; inTheirs && th != t {
+						l = strings.Replace(l, t, th, 1) // keep ours' indentation
+					}
+				}
+			}
 			out = append(out, l)
 		}
 	}
-	add(ours)
-	add(theirs)
+	add(ours, true)
+	add(theirs, false)
 	body := strings.Join(out, "\n")
 	if strings.HasSuffix(ours, "\n") || strings.HasSuffix(theirs, "\n") {
 		body += "\n"

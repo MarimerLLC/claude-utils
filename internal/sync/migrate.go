@@ -35,6 +35,20 @@ type MigrateOptions struct {
 	// skipped rather than merged back in or saved as a collision backup.
 	Prior PriorVersionFunc
 
+	// Base, if set, returns the newest version that both the legacy file
+	// ("<localHash>/memory/<name>") and the key's file ("<key>/memory/<name>")
+	// have held in the sync repo's history, or nil. When the two differ it is
+	// the base of a 3-way merge, so an edit made to the legacy copy (by a PC on
+	// an older version, or one whose sync was stuck) is merged into the key's
+	// file instead of only being saved as a backup — which pruning then left
+	// as the sole copy of the newer text.
+	Base SharedVersionFunc
+
+	// LegacyLater, if set, reports whether the legacy file was changed more
+	// recently than the key's file. It decides an overlapping edit when the
+	// frontmatter timestamps can't (see resolveText).
+	LegacyLater ChangedLaterFunc
+
 	// Prune deletes legacy files once imported (and their dirs once empty). Only
 	// safe once every PC syncing this repo runs a fingerprint-aware version: an
 	// older version reads the deletion as "user deleted these memories" and
@@ -45,13 +59,36 @@ type MigrateOptions struct {
 // PriorVersionFunc: see MigrateOptions.Prior.
 type PriorVersionFunc func(rel string, content []byte) bool
 
+// SharedVersionFunc: see MigrateOptions.Base.
+type SharedVersionFunc func(legacyRel, rel string) []byte
+
+// ChangedLaterFunc: see MigrateOptions.LegacyLater.
+type ChangedLaterFunc func(legacyRel, rel string) bool
+
+// SharedVersionIn returns a SharedVersionFunc backed by the sync repo's
+// history on HEAD.
+func SharedVersionIn(repo *gitwt.Repo) SharedVersionFunc {
+	return func(legacyRel, rel string) []byte {
+		return sharedVersion(repo, "HEAD", "projects/"+legacyRel, "HEAD", "projects/"+rel)
+	}
+}
+
+// ChangedLaterIn returns a ChangedLaterFunc backed by the sync repo's history
+// on HEAD.
+func ChangedLaterIn(repo *gitwt.Repo) ChangedLaterFunc {
+	return func(legacyRel, rel string) bool {
+		return changedLater(repo, "HEAD", "projects/"+legacyRel, "HEAD", "projects/"+rel)
+	}
+}
+
 // MigrateLayout imports legacy path-keyed mirror directories into their
 // fingerprint keys, so a project previously split by path (a separate dir per
 // machine) collapses to one key. When the key dir already holds the file —
 // another machine imported it, or this project has been syncing under the key —
 // the two are unioned: MEMORY.md via the semantic merge driver, other files
-// copied when absent, and genuine conflicts preserved as
-// <name>.from-remote-<random>.
+// copied when absent or else merged 3-way against the version both have held
+// (see MigrateOptions.Base), with the losing side of an overlapping edit
+// preserved as <name>.from-remote-<random>.
 //
 // Legacy dirs are left in place unless opt.Prune is set: PCs still running a
 // pre-fingerprint version keep reading and writing them, and deleting them
@@ -127,17 +164,39 @@ func MigrateLayout(r Roots, idx *project.Index, opt MigrateOptions) (SyncReport,
 				}
 				rep.CopiedToMirror = append(rep.CopiedToMirror, rel)
 			case name == "MEMORY.md":
-				merged, _ := merge.Merge("", string(newBytes), string(oldBytes))
+				var base []byte
+				if opt.Base != nil {
+					base = opt.Base(legacyRel, rel)
+				}
+				merged, _ := merge.Merge(string(base), string(newBytes), string(oldBytes))
 				if err := writeFile(newPath, []byte(merged)); err != nil {
 					return rep, err
 				}
 				rep.Merged = append(rep.Merged, rel)
 			default:
-				backup := fmt.Sprintf("%s.from-remote-%s", newPath, randSuffix())
-				if err := writeFile(backup, oldBytes); err != nil {
-					return rep, err
+				// Both exist and differ: merge them as a pull would, with the
+				// key's file as "ours" and the legacy copy as "theirs". Only an
+				// overlapping edit has a loser, and its original is kept as a
+				// backup next to the key's file.
+				var base []byte
+				if opt.Base != nil {
+					base = opt.Base(legacyRel, rel)
 				}
-				rep.BackedUp = append(rep.BackedUp, rel)
+				legacyLater := opt.LegacyLater != nil && opt.LegacyLater(legacyRel, rel)
+				res := resolveText(base, newBytes, oldBytes, legacyLater)
+				if !bytes.Equal(res.content, newBytes) {
+					if err := writeFile(newPath, res.content); err != nil {
+						return rep, err
+					}
+					rep.Merged = append(rep.Merged, rel)
+				}
+				if res.loser != nil {
+					backup := fmt.Sprintf("%s.from-remote-%s", newPath, randSuffix())
+					if err := writeFile(backup, res.loser); err != nil {
+						return rep, err
+					}
+					rep.BackedUp = append(rep.BackedUp, rel)
+				}
 			}
 			if opt.State != nil {
 				opt.State.Record(legacyRel, sum)

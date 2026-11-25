@@ -73,8 +73,10 @@ func (r Resolution) String() string {
 //   - MEMORY.md: merged section by section in-process (merge.Merge), which
 //     keeps both versions of overlapping edits, so it never leaves markers and
 //     doesn't depend on the merge driver being configured.
-//   - Any other file both sides changed (or both added): see resolveText. The
-//     losing side's original version, if one had to lose, is returned in
+//   - Any other file both sides changed (or both added): see resolveText. For
+//     a file both sides added, git has no base; the newest version both
+//     sides' histories share stands in (see sharedVersion). The losing
+//     side's original version, if one had to lose, is returned in
 //     Backups, for the caller to write next to the file as
 //     <name>.from-remote-<random> once the merge is committed. Backups are
 //     git-ignored, so they stay on this PC for the user to review.
@@ -102,6 +104,12 @@ func resolveConflicts(repo *gitwt.Repo) (Resolution, error) {
 				if base, err = repo.ShowStage(1, e.Path); err != nil {
 					return res, err
 				}
+			} else {
+				// Added on both sides (add/add): git has no base. The two adds
+				// often descend from one version anyway — two PCs migrating the
+				// same project into its fingerprint key, say. Use it as the base
+				// so only real edits conflict, not the whole file.
+				base = sharedVersion(repo, "MERGE_HEAD", e.Path, "HEAD", e.Path)
 			}
 			ours, err := repo.ShowStage(2, e.Path)
 			if err != nil {
@@ -121,7 +129,8 @@ func resolveConflicts(repo *gitwt.Repo) (Resolution, error) {
 				}
 				out, how = []byte(merged), "MEMORY.md merge"
 			} else {
-				r := resolveText(base, ours, theirs)
+				theirsLater := changedLater(repo, "MERGE_HEAD", e.Path, "HEAD", e.Path)
+				r := resolveText(base, ours, theirs, theirsLater)
 				out, loser, how = r.content, r.loser, r.how
 			}
 			if err := writeFile(abs, out); err != nil {
@@ -187,26 +196,33 @@ type textResolution struct {
 //     with no backup: only the timestamp differed, or the edits didn't
 //     overlap.
 //  4. Otherwise the side with the newer timestamp wins every conflicting hunk
-//     (keeping the other side's non-overlapping changes); this PC wins when
-//     either side has no timestamp or they are equal. The loser's original,
-//     unmodified version is returned as the backup.
+//     (keeping the other side's non-overlapping changes). When the timestamps
+//     can't decide — either side has none, or they are equal — theirsLater
+//     does: the side whose last change in git history is more recent wins,
+//     and this PC wins only if that too is a tie (or unknown). Without that
+//     fallback, a stale local copy with no timestamp silently beat a newer
+//     edit from another PC. The loser's original, unmodified version is
+//     returned as the backup.
 //
 // Binary content (a NUL byte, as git judges it) can't be merged line by line,
 // and neither can anything when `git merge-file` fails to run: then the
 // winner, chosen the same way, is taken as a whole file. resolveText never
 // fails, so no conflict of this kind can stop a merge from completing.
-func resolveText(base, ours, theirs []byte) textResolution {
+func resolveText(base, ours, theirs []byte, theirsLater bool) textResolution {
 	rawO, tO, okO := modifiedOf(ours)
 	rawT, tT, okT := modifiedOf(theirs)
-	theirsNewer := okO && okT && tT.After(tO)
+	theirsNewer := theirsLater
+	if okO && okT && !tT.Equal(tO) {
+		theirsNewer = tT.After(tO)
+	}
 
 	if isBinary(base) || isBinary(ours) || isBinary(theirs) {
 		return wholeFile(ours, theirs, theirsNewer, "binary")
 	}
 
-	newest := ""
+	newest := "" // the newest `modified:` value, from the timestamps alone
 	switch {
-	case theirsNewer:
+	case okO && okT && tT.After(tO):
 		newest = rawT
 	case okO:
 		newest = rawO

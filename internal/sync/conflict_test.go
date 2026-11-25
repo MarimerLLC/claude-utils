@@ -210,7 +210,8 @@ func TestResolve_TimestampOnlyConflictMergesClean(t *testing.T) {
 	}
 }
 
-// 3. No frontmatter: this PC wins and origin's version is the backup.
+// 3. No frontmatter, and this PC's edit is the later one: this PC wins and
+// origin's version is the backup.
 func TestResolve_NoTimestampLocalWins(t *testing.T) {
 	_, a, b := conflictFixture(t)
 	const rel = "projects/k/memory/plain.md"
@@ -439,14 +440,15 @@ func TestSetModified(t *testing.T) {
 	}
 }
 
-// Equal timestamps, or one side without one: this PC wins.
+// Equal timestamps, or one side without one, and no later change on theirs
+// in history: this PC wins.
 func TestResolveText_TiesGoToThisPC(t *testing.T) {
 	base := []byte(note(t0, "a\nb\nc\n"))
 	for name, theirsStamp := range map[string]string{"equal": t1, "theirs missing": ""} {
 		t.Run(name, func(t *testing.T) {
 			ours := []byte(note(t1, "a\nb-ours\nc\n"))
 			theirs := []byte(note(theirsStamp, "a\nb-theirs\nc\n"))
-			r := resolveText(base, ours, theirs)
+			r := resolveText(base, ours, theirs, false)
 			if !strings.Contains(string(r.content), "b-ours") || strings.Contains(string(r.content), "b-theirs") {
 				t.Fatalf("this PC should win: %q", r.content)
 			}
@@ -454,6 +456,97 @@ func TestResolveText_TiesGoToThisPC(t *testing.T) {
 				t.Fatalf("loser should be theirs' original: %q", r.loser)
 			}
 		})
+	}
+}
+
+// When the timestamps can't decide, the side changed later in history wins,
+// rather than this PC by default. A stamped newer side still beats history.
+func TestResolveText_HistoryBreaksTimestampTie(t *testing.T) {
+	base := []byte(note("", "a\nb\nc\n"))
+	cases := map[string]struct{ oursStamp, theirsStamp string }{
+		"both missing":   {"", ""},
+		"ours missing":   {"", t1},
+		"theirs missing": {t1, ""},
+		"equal":          {t1, t1},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			ours := []byte(note(c.oursStamp, "a\nb-ours\nc\n"))
+			theirs := []byte(note(c.theirsStamp, "a\nb-theirs\nc\n"))
+			r := resolveText(base, ours, theirs, true)
+			if !strings.Contains(string(r.content), "b-theirs") || strings.Contains(string(r.content), "b-ours") {
+				t.Fatalf("the later change should win: %q", r.content)
+			}
+			if string(r.loser) != string(ours) {
+				t.Fatalf("loser should be ours' original: %q", r.loser)
+			}
+		})
+	}
+	t.Run("timestamps decide first", func(t *testing.T) {
+		ours := []byte(note(t2, "a\nb-ours\nc\n"))
+		theirs := []byte(note(t1, "a\nb-theirs\nc\n"))
+		if r := resolveText(base, ours, theirs, true); !strings.Contains(string(r.content), "b-ours") {
+			t.Fatalf("a newer timestamp must outrank history: %q", r.content)
+		}
+	})
+}
+
+// commitDated writes and commits one file with a fixed author date.
+func commitDated(t *testing.T, r *gitwt.Repo, rel, content, date string) {
+	t.Helper()
+	writeAt(t, r, rel, content)
+	mustGit(t, r, "add", "-A")
+	mustGit(t, r, "commit", "-q", "--date="+date, "-m", "edit "+rel)
+}
+
+// Neither copy has a timestamp and the edits overlap: the edit made later
+// wins even when it is origin's, and this PC's version is the backup. (This
+// PC used to win every such tie, so a stale local copy beat a newer edit.)
+func TestResolve_NoTimestampLaterRemoteEditWins(t *testing.T) {
+	_, a, b := conflictFixture(t)
+	const rel = "projects/k/memory/plain.md"
+	commitAt(t, a, rel, "a\nb\nc\n", true)
+	mustPull(t, b)
+
+	commitDated(t, b, rel, "a\nb-ours\nc\n", "2026-11-20T10:00:00Z")
+	commitDated(t, a, rel, "a\nb-theirs\nc\n", "2026-11-21T10:00:00Z")
+	mustGit(t, a, "push", "-q", "origin", "main")
+
+	mustPull(t, b)
+	if got := readAt(t, b, rel); got != "a\nb-theirs\nc\n" {
+		t.Fatalf("the later edit (origin's) should win: %q", got)
+	}
+	bk := backupsOf(t, b, rel)
+	if len(bk) != 1 {
+		t.Fatalf("want one backup, got %v", bk)
+	}
+	if got, _ := os.ReadFile(bk[0]); string(got) != "a\nb-ours\nc\n" {
+		t.Fatalf("backup should hold this PC's version: %q", got)
+	}
+}
+
+// Both PCs add the same file (as two PCs migrating one project into its
+// fingerprint key do), but origin's copy is a later edit of the very version
+// this PC added. git has no base for an add/add; the version both histories
+// share is used instead, so origin's edit merges in cleanly — even though
+// this PC committed last and neither copy has a timestamp.
+func TestResolve_AddAddUsesSharedHistoryAsBase(t *testing.T) {
+	_, a, b := conflictFixture(t)
+	const rel = "projects/k/memory/renamed.md"
+	v1 := "The server was renamed (repo\n`S:/src/old-name`, commit b38414b). The rename is\ndisplay strings only.\n"
+	v2 := strings.Replace(v1, "`S:/src/old-name`", "now cloned at `S:/src/new-name`", 1)
+
+	commitDated(t, a, rel, v1, "2026-11-20T10:00:00Z")
+	commitDated(t, a, rel, v2, "2026-11-21T10:00:00Z")
+	mustGit(t, a, "push", "-q", "origin", "main")
+	commitDated(t, b, rel, v1, "2026-11-22T10:00:00Z") // b never saw a's add
+
+	mustPull(t, b)
+	if got := readAt(t, b, rel); got != v2 {
+		t.Fatalf("origin's edit should merge in cleanly:\n got %q\nwant %q", got, v2)
+	}
+	if bk := backupsOf(t, b, rel); len(bk) != 0 {
+		t.Fatalf("a clean merge needs no backup, got %v", bk)
 	}
 }
 
@@ -569,7 +662,7 @@ func TestResolveText_TimestampWithComment(t *testing.T) {
 	base := []byte("---\nmodified: 2026-11-20T10:00:00Z\n---\na\nb\nc\n")
 	ours := []byte("---\nmodified: 2026-11-21T10:00:00Z\n---\na\nb-ours\nc\n")
 	theirs := []byte("---\nmodified: 2026-11-22T10:00:00Z # moved\n---\na\nb-theirs\nc\n")
-	r := resolveText(base, ours, theirs)
+	r := resolveText(base, ours, theirs, false)
 	if string(r.content) != string(theirs) {
 		t.Fatalf("newer (commented) side should win:\n got %q\nwant %q", r.content, theirs)
 	}
