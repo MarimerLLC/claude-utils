@@ -225,9 +225,9 @@ never leaves conflict markers in a file.
 
 | Conflict | Result |
 |---|---|
-| `MEMORY.md`, both PCs edited it | Merged section by section. Where both edited the same lines, **both versions are kept** (this PC's first). Done in-process, so it works even if the merge driver isn't configured. |
-| Other memory file, both PCs edited it | The frontmatter `modified:` timestamp (top-level or under `metadata:`) is set to the newer of the two on every version first, so the timestamp alone never conflicts. If the edits don't overlap, they merge cleanly with **no backup**. Otherwise the side with the **newer `modified:` wins** each overlapping section (the other side's non-overlapping edits are kept); if either side has no timestamp, or they're equal, **this PC wins**. |
-| Both PCs created a file with the same name | Same as above, with an empty common ancestor. |
+| `MEMORY.md`, both PCs edited it | Merged section by section. Where both edited the same lines, **both versions are kept** (this PC's first). In a list section, an entry only one PC edited takes that edit; an entry both edited keeps this PC's line. Done in-process, so it works even if the merge driver isn't configured. |
+| Other memory file, both PCs edited it | The frontmatter `modified:` timestamp (top-level or under `metadata:`) is set to the newer of the two on every version first, so the timestamp alone never conflicts. If the edits don't overlap, they merge cleanly with **no backup**. Otherwise the side with the **newer `modified:` wins** each overlapping section (the other side's non-overlapping edits are kept). If either side has no timestamp, or they're equal, the side whose **last change in the sync repo's history is more recent** wins; this PC wins only when that is a tie too. |
+| Both PCs created a file with the same name | Same as above. git has no common ancestor for these, so the newest version that both PCs' histories of the file share is used as one (two PCs migrating the same project often create copies of one earlier version). With no shared version, the ancestor is empty. |
 | Binary file (contains a NUL byte), both PCs edited it | Can't be merged by line: the winner, chosen by the same timestamp rule, is kept as a whole file. |
 | Edited on one PC, deleted on the other | The edited copy is kept (an edit outranks a delete). |
 | Renamed differently on each PC | Both new names are kept; the old name is removed. |
@@ -372,7 +372,10 @@ If that works without prompting, the daemon will too.
 - **Upgrading from a path-keyed layout**: an upgraded daemon imports the existing
   path-keyed mirror directories into their fingerprint keys, merging any that
   collapse to the same key, and keeps importing edits that not-yet-upgraded PCs
-  make to them (on every pull tick). It **leaves the legacy directories in
+  make to them (on every pull tick). A legacy file that differs from its
+  key's copy is merged into it like a pull conflict (above), against the
+  newest version both have held, so a legacy edit is never only kept as a
+  backup. It **leaves the legacy directories in
   place**: a PC still running the old version would read their deletion as you
   deleting those memories and remove its local copies. Upgrade PCs in any order;
   until a PC is upgraded it keeps syncing through the legacy directories and

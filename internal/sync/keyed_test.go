@@ -2,12 +2,14 @@ package sync
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/MarimerLLC/claude-utils/internal/gitwt"
 	"github.com/MarimerLLC/claude-utils/internal/project"
 )
 
@@ -221,6 +223,132 @@ func TestMigrateLayout_CarriesCollisionBackupsVerbatim(t *testing.T) {
 	}
 	if memExists(t, r.Mirror, "-home-matta-app", backup) {
 		t.Errorf("legacy copy should be pruned once carried over")
+	}
+}
+
+// A legacy copy edited after the key's file was imported from it (by a PC on
+// an older version, or one whose sync was stuck) is merged into the key's
+// file against the version both held — not just saved as a backup, which
+// pruning then left as the only copy of the newer text.
+func TestMigrateLayout_MergesLegacyEditAgainstSharedBase(t *testing.T) {
+	const body = "---\nname: n\n---\n\nl1\nl2\nl3\nl4\nl5\n"
+	cases := map[string]struct{ key, legacy, want string }{
+		"only legacy edited": {
+			key:    body,
+			legacy: strings.Replace(body, "l3", "l3 FIXED", 1),
+			want:   strings.Replace(body, "l3", "l3 FIXED", 1),
+		},
+		"both edited apart": {
+			key:    strings.Replace(body, "l1", "l1-key", 1),
+			legacy: strings.Replace(body, "l5", "l5-legacy", 1),
+			want:   strings.Replace(strings.Replace(body, "l1", "l1-key", 1), "l5", "l5-legacy", 1),
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, root := reconcileFixture(t)
+			idx, key := fingerprintedProject(t, r, root, "-home-matta-app")
+			writeMem(t, r.Mirror, "-home-matta-app", "note.md", c.legacy)
+			writeMem(t, r.Mirror, key, "note.md", c.key)
+			base := func(legacyRel, rel string) []byte { return []byte(body) }
+
+			rep, err := MigrateLayout(r, idx, MigrateOptions{State: NewMigrationState(), Base: base, Prune: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := readMem(t, r.Mirror, key, "note.md"); got != c.want {
+				t.Fatalf("legacy edit not merged:\n got %q\nwant %q", got, c.want)
+			}
+			if len(rep.BackedUp) != 0 {
+				t.Errorf("a clean merge needs no backup; got %#v", rep)
+			}
+			if memExists(t, r.Mirror, "-home-matta-app", "note.md") {
+				t.Errorf("legacy copy should be pruned once merged")
+			}
+		})
+	}
+}
+
+// Overlapping edits with no timestamps: the side changed later in history
+// wins, and the other side's original is kept as a backup.
+func TestMigrateLayout_OverlapGoesToLaterChange(t *testing.T) {
+	for _, legacyLater := range []bool{true, false} {
+		t.Run(fmt.Sprintf("legacyLater=%v", legacyLater), func(t *testing.T) {
+			r, root := reconcileFixture(t)
+			idx, key := fingerprintedProject(t, r, root, "-home-matta-app")
+			writeMem(t, r.Mirror, "-home-matta-app", "note.md", "a\nb-legacy\nc\n")
+			writeMem(t, r.Mirror, key, "note.md", "a\nb-key\nc\n")
+
+			rep, err := MigrateLayout(r, idx, MigrateOptions{
+				State:       NewMigrationState(),
+				Base:        func(string, string) []byte { return []byte("a\nb\nc\n") },
+				LegacyLater: func(string, string) bool { return legacyLater },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			win, lose := "a\nb-key\nc\n", "a\nb-legacy\nc\n"
+			if legacyLater {
+				win, lose = lose, win
+			}
+			if got := readMem(t, r.Mirror, key, "note.md"); got != win {
+				t.Fatalf("got %q, want %q", got, win)
+			}
+			bk, _ := filepath.Glob(filepath.Join(r.Mirror, key, "memory", "note.md.from-remote-*"))
+			if len(bk) != 1 || len(rep.BackedUp) != 1 {
+				t.Fatalf("want one backup; got %v, %#v", bk, rep)
+			}
+			if got, _ := os.ReadFile(bk[0]); string(got) != lose {
+				t.Fatalf("backup should hold the losing version %q, got %q", lose, got)
+			}
+		})
+	}
+}
+
+// The history-backed helpers: the shared version is the newest one both paths
+// held, and the legacy copy counts as changed later after a newer commit.
+func TestSharedVersionAndChangedLaterIn(t *testing.T) {
+	dir := t.TempDir()
+	gitRun(t, dir, "init", "-q", "-b", "main")
+	write := func(rel, content string) {
+		p := filepath.Join(dir, "projects", filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commit := func(msg, date string) {
+		gitRun(t, dir, "add", "-A")
+		gitRun(t, dir, "commit", "-q", "--date="+date, "-m", msg)
+	}
+	const legacy, key = "S--src-app/memory/f.md", "g-0123456789ab/memory/f.md"
+	write(legacy, "v0")
+	commit("legacy v0", "2026-08-01T00:00:00Z")
+	write(legacy, "v1")
+	commit("legacy v1", "2026-09-01T00:00:00Z")
+	write(key, "v1") // migrated from the legacy copy
+	commit("migrate", "2026-11-01T00:00:00Z")
+
+	repo := gitwt.New(dir)
+	if got := string(SharedVersionIn(repo)(legacy, key)); got != "v1" {
+		t.Fatalf("shared version = %q, want v1", got)
+	}
+	if ChangedLaterIn(repo)(legacy, key) {
+		t.Fatal("legacy was not changed after the key's file")
+	}
+
+	write(legacy, "v2") // an old-version PC edits the legacy copy
+	commit("legacy v2", "2026-11-20T00:00:00Z")
+	if got := string(SharedVersionIn(repo)(legacy, key)); got != "v1" {
+		t.Fatalf("shared version after legacy edit = %q, want v1", got)
+	}
+	if !ChangedLaterIn(repo)(legacy, key) {
+		t.Fatal("legacy should count as changed later")
+	}
+	if SharedVersionIn(repo)(legacy, "g-0123456789ab/memory/other.md") != nil {
+		t.Fatal("a path with no history shares no version")
 	}
 }
 

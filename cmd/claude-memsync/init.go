@@ -149,9 +149,11 @@ func bootstrap(cfg config.Config, force bool) error {
 		migState = syncpkg.NewMigrationState()
 	}
 	migRep, err := syncpkg.MigrateLayout(roots, idx, syncpkg.MigrateOptions{
-		State: migState,
-		Prior: syncpkg.PriorVersionIn(repo),
-		Prune: cfg.PruneLegacyDirs,
+		State:       migState,
+		Prior:       syncpkg.PriorVersionIn(repo),
+		Base:        syncpkg.SharedVersionIn(repo),
+		LegacyLater: syncpkg.ChangedLaterIn(repo),
+		Prune:       cfg.PruneLegacyDirs,
 	})
 	if err != nil {
 		return fmt.Errorf("migrate layout: %w", err)
