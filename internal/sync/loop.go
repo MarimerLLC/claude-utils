@@ -113,7 +113,7 @@ func (l *Loop) Run(ctx context.Context) error {
 	} else {
 		l.migState = st
 	}
-	l.rebuildIndex(roots)
+	l.rebuildIndex(repo, roots)
 	l.migrate(repo, roots)
 
 	// Initial sync at startup: reconcile local with mirror (using manifest
@@ -173,7 +173,7 @@ func (l *Loop) Run(ctx context.Context) error {
 				// the change merges instead of overwriting, without waiting for
 				// the pull tick.
 				l.needReconcile = false
-				l.rebuildIndex(roots)
+				l.rebuildIndex(repo, roots)
 				m, err := LoadManifest(l.Cfg.SyncDir)
 				if err != nil {
 					log.Println("load manifest:", err)
@@ -213,7 +213,7 @@ func (l *Loop) Run(ctx context.Context) error {
 			// Refresh the index so projects opened since startup (and any repo
 			// whose remote changed) resolve to the right key, and import edits
 			// pre-upgrade PCs made to legacy dirs, before reconciling.
-			l.rebuildIndex(roots)
+			l.rebuildIndex(repo, roots)
 			l.migrate(repo, roots)
 			var reconErr error
 			if _, err := Reconcile(roots, l.idx, m); err != nil {
@@ -357,8 +357,28 @@ func (l *Loop) syncOnce(repo *gitwt.Repo, roots Roots, includeLocal bool) error 
 	}
 	postRev, _ := repo.Run("rev-parse", "HEAD")
 	if strings.TrimSpace(preRev) != strings.TrimSpace(postRev) && strings.TrimSpace(preRev) != "" {
+		// Follow redirects the pull brought in before applying its changes, so
+		// the deletions of a legacy dir another PC just pruned land on no local
+		// project instead of erasing this PC's copies.
+		moved := l.followRedirects(repo, roots, l.idx, l.idx.All())
+		if len(moved) > 0 {
+			if err := l.idx.Save(l.Cfg.SyncDir); err != nil {
+				log.Println("save project index:", err)
+			}
+		}
 		if err := propagateChanges(repo, roots, l.idx, strings.TrimSpace(preRev), strings.TrimSpace(postRev)); err != nil {
 			return errors.Join(pullErr, fmt.Errorf("propagate: %w", err))
+		}
+		if len(moved) > 0 {
+			// The pull only carried the key's files that changed; reconcile
+			// brings down the rest and sends up this PC's own edits.
+			m, err := LoadManifest(l.Cfg.SyncDir)
+			if err != nil {
+				m = NewManifest()
+			}
+			if _, err := Reconcile(roots, l.idx, m); err != nil {
+				log.Println("reconcile after redirect:", err)
+			}
 		}
 	}
 
@@ -575,9 +595,13 @@ func (l *Loop) migrate(repo *gitwt.Repo, roots Roots) {
 		Base:        SharedVersionIn(repo),
 		LegacyLater: ChangedLaterIn(repo),
 		Prune:       l.Cfg.PruneLegacyDirs,
+		HadLegacy:   HadLegacyIn(repo),
 	})
 	if err != nil {
 		log.Println("migrate layout:", err)
+	}
+	if n := len(rep.Redirected); n > 0 {
+		log.Printf("left moved-to redirects in %d pruned legacy dir(s)", n)
 	}
 	if n := len(rep.CopiedToMirror) + len(rep.Merged) + len(rep.BackedUp); n > 0 {
 		log.Printf("imported legacy mirror dirs into fingerprint keys (%d files)", n)
@@ -590,12 +614,35 @@ func (l *Loop) migrate(repo *gitwt.Repo, roots Roots) {
 	}
 }
 
+// followRedirects applies the moved-to redirects other PCs left for projects
+// idx still keys by path, then adopts every project whose key changed since
+// before (redirected, decoded from its folder name, or re-fingerprinted) so its
+// stale local copies can't overwrite the key's newer ones. Returns the projects
+// that moved onto a new key.
+func (l *Loop) followRedirects(repo *gitwt.Repo, roots Roots, idx *project.Index, before map[string]project.Entry) []string {
+	if moved := FollowRedirects(roots, idx); len(moved) > 0 {
+		log.Printf("following moved-to redirects for %d project(s): %s", len(moved), strings.Join(moved, ", "))
+	}
+	adopted, rep := AdoptRekeyed(roots, before, idx, MigrateOptions{
+		Prior:       PriorVersionIn(repo),
+		Base:        SharedVersionIn(repo),
+		LegacyLater: ChangedLaterIn(repo),
+	})
+	for _, e := range rep.Errors {
+		log.Println(e)
+	}
+	if len(adopted) > 0 {
+		log.Printf("re-keyed %d project(s), merging their local copies into the new key: %s", len(adopted), strings.Join(adopted, ", "))
+	}
+	return adopted
+}
+
 // rebuildIndex refreshes the localHash → fingerprint-key mapping from the
 // current Claude tree and persists it. The previous index seeds the build so
 // unchanged projects skip the git calls and vanished checkouts keep their key.
 // Best-effort: on error it keeps any existing index (or an empty one) so the
 // loop can proceed.
-func (l *Loop) rebuildIndex(roots Roots) {
+func (l *Loop) rebuildIndex(repo *gitwt.Repo, roots Roots) {
 	idx, err := project.Build(roots.Claude, l.idx)
 	if err != nil {
 		log.Println("build project index:", err)
@@ -604,6 +651,11 @@ func (l *Loop) rebuildIndex(roots Roots) {
 		}
 		return
 	}
+	var before map[string]project.Entry
+	if l.idx != nil {
+		before = l.idx.All()
+	}
+	l.followRedirects(repo, roots, idx, before)
 	l.idx = idx
 	if err := idx.Save(l.Cfg.SyncDir); err != nil {
 		log.Println("save project index:", err)

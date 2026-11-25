@@ -157,7 +157,12 @@ and SSH keys. None require root.
 its absolute path (`/Users/me/code/foo` → `-Users-me-code-foo`), which differs
 per machine. Keying the sync repo by that name would split one repo into several.
 Instead the daemon resolves each project's real path (from the `cwd` Claude
-records in its session transcripts) and derives a machine-independent **key**:
+records in its session transcripts) and derives a machine-independent **key**.
+When no transcript names an existing directory — a project folder sync created
+for a repo you've never opened in Claude on this PC, or one whose recorded
+checkout was renamed or moved — it decodes the folder name instead, looking for
+the one existing directory that encodes to it. If none or several match, the
+project stays on its path key rather than guessing. The key is one of:
 
 - `g-<hash>` — from the normalized `origin` remote URL (all of
   `git@github.com:Acme/app.git`, `https://github.com/acme/app`, and
@@ -196,7 +201,17 @@ directories and keeps keys stable: a project whose checkout has since gone away
 (removed worktree, unmounted drive, transcripts cleaned up by Claude) keeps its
 last key rather than falling back to the path key. Projects whose transcripts
 haven't changed since the last pass are not re-fingerprinted, so the periodic
-rebuild stays cheap.
+rebuild stays cheap (path-keyed ones are, so they pick up a checkout that
+appears later).
+
+When a project's key changes (it decodes for the first time, follows a
+redirect, or its clone gains an `origin` remote), its local memory files are
+copies last synced under the old key, and the new key may hold newer versions
+from other PCs. The daemon folds each local file into the new key the way it
+imports a legacy directory: a version the key already moved past gives way to
+the key's copy, a file the key never had is sent up, and a real local edit is
+merged against the history the two keys share. A stale copy never overwrites a
+newer one.
 
 **Lazy materialization.** A project synced from another PC but never opened on
 this one stays pending in the mirror — there's no local path to write it to yet.
@@ -386,14 +401,31 @@ If that works without prompting, the daemon will too.
 - **Pruning legacy directories**: once **every** PC syncing the repo runs a
   fingerprint-aware version, set `"pruneLegacyDirs": true` in
   `~/.claudesync/config.json` and restart the daemon. It deletes each legacy
-  file after importing it (and the directory once empty) and pushes the
-  deletions; other upgraded PCs ignore them. A PC only prunes the legacy
+  file after importing it and pushes the deletions. A PC only prunes the legacy
   directories of its own project paths, so if your PCs use different paths, set
   it on each of them.
+
+  Pruning leaves a `projects/<legacy dir>/moved-to` file naming the key. That's
+  for other PCs that still key the same folder by path, because they can't
+  fingerprint it (the repo isn't checked out there). They follow the redirect
+  onto the key instead of reading the deletions as you deleting those memories.
+  Before v0.4.2 there was no redirect, and such a PC deleted its local copies.
+  The memories survived under the key, but that PC no longer saw them. A v0.4.2
+  PC with `pruneLegacyDirs` set writes the missing redirects for directories an
+  earlier version pruned. The first redirect written for a directory is kept.
+
+  Before turning it on, make sure every clone of a repo has the same `origin`
+  URL, or no remote on any of them. A clone with no `origin` (an `r-…` key)
+  doesn't line up with clones that have one (`g-…`), and if that PC prunes
+  first, its redirect points at the wrong key.
 - **Fingerprint edge cases**: a shallow clone (`git clone --depth 1`) has no true
   root commit, so a remote-less shallow repo falls back to the path key. A repo
   whose `origin` URL is later changed (renamed org, new host) re-keys — the next
-  time that project is used — and re-merges under the new key.
+  time that project is used — and re-merges under the new key. That includes a
+  repo renamed on GitHub: change `origin` on every PC's clone together, or the
+  one you change splits off. Folder-name decoding can't tell a dash in a name
+  from a path separator; when two existing directories match, the project stays
+  on its path key.
 - **Conflicts are settled automatically, not interactively**: there's no prompt
   when two PCs edit the same lines. `MEMORY.md` keeps both versions (you may
   want to tidy duplicated lines); other files keep the newer version and save

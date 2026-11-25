@@ -103,11 +103,25 @@ func resolveEntry(claudeProjectsDir, localHash string, prev *Index) (entry Entry
 	if prev != nil {
 		old, hadOld = prev.byLocal[localHash]
 	}
-	if hadOld && stamp != "" && old.Stamp == stamp {
-		return old, false // nothing Claude records about this project changed
+	if hadOld && stamp != "" && old.Stamp == stamp && old.Method != MethodPath {
+		// Nothing Claude records about this project changed. Path-keyed entries
+		// are always re-resolved: decoding the folder name (below) can key them
+		// even when their transcripts can't.
+		return old, false
 	}
 
 	realPath, resolved := ResolvePath(dir)
+	if !isDir(realPath) {
+		// No transcript names the project's directory (a folder sync materialized
+		// for a project never opened here), or the one it names is gone (a renamed
+		// or moved checkout). The folder name itself encodes this machine's path,
+		// so look for the directory it stands for. Every PC with the project at
+		// that path then fingerprints it the same way, instead of this PC alone
+		// staying on the path key — which another PC's pruneLegacyDirs would empty.
+		if p, ok := DecodePath(localHash); ok {
+			realPath, resolved = p, true
+		}
+	}
 	key, method := Fingerprint(realPath, localHash)
 	if method == MethodPath && hadOld && old.Method != MethodPath && !isDir(realPath) {
 		// The checkout this project was fingerprinted from is gone or

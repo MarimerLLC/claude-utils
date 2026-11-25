@@ -144,6 +144,22 @@ func bootstrap(cfg config.Config, force bool) error {
 	if err != nil {
 		return fmt.Errorf("build project index: %w", err)
 	}
+	if moved := syncpkg.FollowRedirects(roots, idx); len(moved) > 0 {
+		fmt.Printf("following moved-to redirects for %d project(s)\n", len(moved))
+	}
+	if prevIdx != nil {
+		adopted, rep := syncpkg.AdoptRekeyed(roots, prevIdx.All(), idx, syncpkg.MigrateOptions{
+			Prior:       syncpkg.PriorVersionIn(repo),
+			Base:        syncpkg.SharedVersionIn(repo),
+			LegacyLater: syncpkg.ChangedLaterIn(repo),
+		})
+		for _, e := range rep.Errors {
+			fmt.Fprintln(os.Stderr, e)
+		}
+		if len(adopted) > 0 {
+			fmt.Printf("re-keyed %d project(s)\n", len(adopted))
+		}
+	}
 	migState, err := syncpkg.LoadMigrationState(cfg.SyncDir)
 	if err != nil {
 		migState = syncpkg.NewMigrationState()
@@ -154,6 +170,7 @@ func bootstrap(cfg config.Config, force bool) error {
 		Base:        syncpkg.SharedVersionIn(repo),
 		LegacyLater: syncpkg.ChangedLaterIn(repo),
 		Prune:       cfg.PruneLegacyDirs,
+		HadLegacy:   syncpkg.HadLegacyIn(repo),
 	})
 	if err != nil {
 		return fmt.Errorf("migrate layout: %w", err)
